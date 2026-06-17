@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import re
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -14,6 +16,8 @@ from twitchAPI.chat import Chat, ChatMessage, EventData
 from twitchAPI.oauth import UserAuthenticationStorageHelper
 from twitchAPI.twitch import Twitch
 from twitchAPI.type import AuthScope, ChatEvent
+from twitchAPI.eventsub.websocket import EventSubWebsocket
+from twitchAPI.object.eventsub import ChannelRaidEvent
 
 from parse_helpers.homoglyphs import advanced_normalise
 from parse_helpers.thisis import is_link, contains_non_twitch_link
@@ -52,6 +56,8 @@ if not logger.handlers:
 # Config
 # -----------------------------
 
+TIMEZONE_REGEX = re.compile(r"\btime.?zones?\b", re.IGNORECASE)
+
 APP_ID = os.environ["TWITCH_CLIENT_ID"]
 APP_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
 
@@ -68,6 +74,7 @@ SCOPES = [
     AuthScope.CHAT_READ,
     AuthScope.CHAT_EDIT,
     AuthScope.MODERATOR_MANAGE_BANNED_USERS,
+    AuthScope.MODERATOR_MANAGE_SHOUTOUTS,
 ]
 
 
@@ -380,6 +387,112 @@ async def handle_regular_command(msg: ChatMessage) -> bool:
     await msg.reply(response)
     return True
 
+async def handle_regular_remove_command(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    command_aliases = ("!removeregular", "!delregular", "!removereg", "!delreg")
+
+    command_used = None
+    for alias in command_aliases:
+        if text == alias or text.startswith(alias + " "):
+            command_used = alias
+            break
+
+    if command_used is None:
+        return False
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        return True
+
+    parts = text.split(maxsplit=1)
+
+    if len(parts) < 2:
+        await msg.reply("Usage: !removeregular username")
+        return True
+
+    target_login = clean_login(parts[1])
+
+    user_id_to_remove = None
+    for user_id, info in regulars.items():
+        if info.get("login") == target_login:
+            user_id_to_remove = user_id
+            break
+
+    if user_id_to_remove is None:
+        await msg.reply(f"{target_login} is not a regular.")
+        return True
+
+    removed_info = regulars.pop(user_id_to_remove)
+    user_data["regulars"] = regulars
+    save_user_data()
+
+    logger.info(
+        "[REGULAR REMOVED] %s (%s) by %s",
+        removed_info.get("display_name"),
+        user_id_to_remove,
+        msg.user.name,
+    )
+
+    await msg.reply(f"{removed_info.get('display_name')} has been removed from the regulars.")
+    return True
+
+async def regular_check(msg: ChatMessage) -> bool: # command for users to check if they are a regular
+    text = msg.text.strip()
+
+    command_aliases = ("!isregular", "!checkregular", "!amiregular")
+
+    command_used = None
+    for alias in command_aliases:
+        if text == alias or text.startswith(alias + " "):
+            command_used = alias
+            break
+
+    if command_used is None:
+        return False
+
+    user_id = msg.user.id
+    if user_id in regulars:
+        await msg.reply(f"{msg.user.display_name}, you are a regular!")
+    else:
+        await msg.reply(f"{msg.user.display_name}, you are not a regular.")
+    return True
+
+async def lurk_announcement(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    command_aliases = ("!lurk", "!brb", "!afk", "!lurking")
+
+    command_used = None
+    for alias in command_aliases:
+        if text == alias or text.startswith(alias + " "):
+            command_used = alias
+            break
+
+    if command_used is None:
+        return False
+
+    await msg.reply(f"{msg.user.display_name} is now lurking. See you later!")
+    return True
+
+async def coinflip_command(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    command_aliases = ("!coinflip", "!flipcoin", "!flip", "!coin")
+
+    command_used = None
+    for alias in command_aliases:
+        if text == alias or text.startswith(alias + " "):
+            command_used = alias
+            break
+
+    if command_used is None:
+        return False
+
+    result = random.randint(0, 1)
+    await msg.reply(f"{msg.user.display_name} flipped a coin and got: {'Heads' if result == 0 else 'Tails'}")
+    return True
 
 # -----------------------------
 # Chat event handlers
@@ -392,14 +505,63 @@ async def on_ready(event: EventData) -> None:
 async def on_message(msg: ChatMessage) -> None:
     if await handle_regular_command(msg):
         return
-
+    if await handle_regular_remove_command(msg):
+        return
+    if await regular_check(msg):
+        return
+    if await lurk_announcement(msg):
+        return
+    if await coinflip_command(msg):
+        return
     normalized_text = advanced_normalise(msg.text)
 
     if await handle_auto_moderation(msg, normalized_text):
         return
+    
+    if TIMEZONE_REGEX.search(normalized_text):
+        # mention what time it is for me
+        now = datetime.now(ZoneInfo("Europe/London"))
+        await msg.reply(f"For me the time is: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
     
+async def on_raid(data: ChannelRaidEvent) -> None:
+    assert twitch is not None
+    assert broadcaster_id is not None
+    assert moderator_id is not None
 
+    raid = data.event
+
+    logger.info(
+        "[RAID] %s (%s) raided with %s viewers",
+        raid.from_broadcaster_user_name,
+        raid.from_broadcaster_user_login,
+        raid.viewers,
+    )
+
+    if DRY_RUN:
+        logger.info(
+            "[DRY RUN] Would shout out %s",
+            raid.from_broadcaster_user_login,
+        )
+        return
+
+    try:
+        await twitch.send_a_shoutout(
+            from_broadcaster_id=broadcaster_id,
+            to_broadcaster_id=raid.from_broadcaster_user_id,
+            moderator_id=moderator_id,
+        )
+
+        logger.info(
+            "[SHOUTOUT] Sent shoutout to %s",
+            raid.from_broadcaster_user_login,
+        )
+
+    except Exception:
+        logger.exception(
+            "[SHOUTOUT FAILED] Could not shout out %s",
+            raid.from_broadcaster_user_login,
+        )
 
 # -----------------------------
 # Main
@@ -432,11 +594,21 @@ async def main() -> None:
 
     chat.start()
 
+
+    eventsub = EventSubWebsocket(twitch)
+    eventsub.start()
+
+    await eventsub.listen_channel_raid(
+        on_raid,
+        to_broadcaster_user_id=broadcaster_id,
+    )
+
     try:
         logger.info("Running. Press Enter to stop.")
         await asyncio.to_thread(input)
     finally:
         chat.stop()
+        await eventsub.stop()
         await twitch.close()
 
 

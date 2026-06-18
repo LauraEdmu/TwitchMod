@@ -245,21 +245,23 @@ async def add_regular_by_login(login: str, added_by_msg: ChatMessage) -> tuple[b
 # Permissions / protection
 # -----------------------------
 
-def is_command_allowed(msg: ChatMessage) -> bool:
+def is_command_allowed(msg: ChatMessage, allow_vip: bool = False) -> bool:
     name = msg.user.name.lower()
 
     # Broadcaster should always be allowed.
     if name == TARGET_CHANNEL:
         return True
 
-    # Mods can manage regulars.
     if msg.user.mod:
+        return True
+
+    if allow_vip and msg.user.vip:
         return True
 
     return False
 
 
-def is_protected_user(msg: ChatMessage) -> bool:
+def is_protected_user(msg: ChatMessage, protect_vip: bool = False) -> bool:
     name = msg.user.name.lower()
 
     if name == TARGET_CHANNEL:
@@ -269,6 +271,9 @@ def is_protected_user(msg: ChatMessage) -> bool:
         return True
 
     if msg.user.mod:
+        return True
+
+    if protect_vip and msg.user.vip:
         return True
 
     return False

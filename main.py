@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+import aiofiles
 
 from dotenv import load_dotenv
 
@@ -77,6 +78,11 @@ SCOPES = [
     AuthScope.MODERATOR_MANAGE_SHOUTOUTS,
 ]
 
+AUDITS_ACTIONS_PATH = Path("audits") / f"{TARGET_CHANNEL}_actions.json"
+AUDITS_MESSAGES_PATH = Path("audits") / f"{TARGET_CHANNEL}_messages.json"
+AUDITS_ACTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+audit_log_lock = asyncio.Lock()
 
 # -----------------------------
 # Data models
@@ -308,12 +314,56 @@ async def handle_auto_moderation(msg: ChatMessage, normalized_text: str) -> bool
     rule = find_matching_rule(normalized_text)
     if rule:
         await timeout_user(msg, rule)
+        await message_to_audit_log(msg, action=f"auto_mod_timeout_{rule.name}")
         return True
 
     if await handle_link_moderation(msg, normalized_text):
+        await message_to_audit_log(msg, action="auto_mod_timeout_link")
         return True
 
     return False
+
+async def message_to_audit_log(msg: ChatMessage, action: str = "") -> None:
+    async with audit_log_lock:
+        log_entry = {
+            "msg_id": msg.id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": [action] if action else [],
+            "user_id": msg.user.id,
+            "user_name": msg.user.name,
+            "user_display_name": msg.user.display_name,
+            "text": msg.text,
+        }
+
+        entries = []
+        found = False
+
+        if AUDITS_MESSAGES_PATH.exists():
+            async with aiofiles.open(AUDITS_MESSAGES_PATH, mode="r", encoding="utf-8") as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    entry = json.loads(line)
+
+                    if entry.get("msg_id") == msg.id:
+                        found = True
+
+                        if "action" not in entry or not isinstance(entry["action"], list):
+                            entry["action"] = []
+
+                        if action:
+                            entry["action"].append(action)
+
+                    entries.append(entry)
+
+        if not found:
+            entries.append(log_entry)
+
+        async with aiofiles.open(AUDITS_MESSAGES_PATH, mode="w", encoding="utf-8") as f:
+            for entry in entries:
+                await f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 # -----------------------------
 # Twitch actions
@@ -368,6 +418,7 @@ async def handle_regular_command(msg: ChatMessage) -> bool:
     if not is_command_allowed(msg):
         logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
         await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_command")
         return True
 
     parts = text.split(maxsplit=1)
@@ -381,8 +432,10 @@ async def handle_regular_command(msg: ChatMessage) -> bool:
 
     if ok:
         logger.info("[COMMAND] %s used %s on %s", msg.user.name, command_used, target_login)
+        await message_to_audit_log(msg, action="command_success")
     else:
         logger.info("[COMMAND FAILED] %s used %s on %s", msg.user.name, command_used, target_login)
+        await message_to_audit_log(msg, action="command_failed")
 
     await msg.reply(response)
     return True
@@ -390,7 +443,7 @@ async def handle_regular_command(msg: ChatMessage) -> bool:
 async def handle_regular_remove_command(msg: ChatMessage) -> bool:
     text = msg.text.strip()
 
-    command_aliases = ("!removeregular", "!delregular", "!removereg", "!delreg")
+    command_aliases = ("!removeregular", "!delregular", "!removereg", "!delreg", "!dereg")
 
     command_used = None
     for alias in command_aliases:
@@ -404,6 +457,7 @@ async def handle_regular_remove_command(msg: ChatMessage) -> bool:
     if not is_command_allowed(msg):
         logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
         await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_command")
         return True
 
     parts = text.split(maxsplit=1)
@@ -427,6 +481,7 @@ async def handle_regular_remove_command(msg: ChatMessage) -> bool:
     removed_info = regulars.pop(user_id_to_remove)
     user_data["regulars"] = regulars
     save_user_data()
+    await message_to_audit_log(msg, action="command_success")
 
     logger.info(
         "[REGULAR REMOVED] %s (%s) by %s",
@@ -441,7 +496,7 @@ async def handle_regular_remove_command(msg: ChatMessage) -> bool:
 async def regular_check(msg: ChatMessage) -> bool: # command for users to check if they are a regular
     text = msg.text.strip()
 
-    command_aliases = ("!isregular", "!checkregular", "!amiregular")
+    command_aliases = ("!isregular", "!checkregular", "!amiregular", "!amireg")
 
     command_used = None
     for alias in command_aliases:
@@ -455,8 +510,10 @@ async def regular_check(msg: ChatMessage) -> bool: # command for users to check 
     user_id = msg.user.id
     if user_id in regulars:
         await msg.reply(f"{msg.user.display_name}, you are a regular!")
+        await message_to_audit_log(msg, action="regular_check_true")
     else:
         await msg.reply(f"{msg.user.display_name}, you are not a regular.")
+        await message_to_audit_log(msg, action="regular_check_false")
     return True
 
 async def lurk_announcement(msg: ChatMessage) -> bool:
@@ -474,6 +531,7 @@ async def lurk_announcement(msg: ChatMessage) -> bool:
         return False
 
     await msg.reply(f"{msg.user.display_name} is now lurking. See you later!")
+    await message_to_audit_log(msg, action="lurk_announcement")
     return True
 
 async def coinflip_command(msg: ChatMessage) -> bool:
@@ -492,6 +550,7 @@ async def coinflip_command(msg: ChatMessage) -> bool:
 
     result = random.randint(0, 1)
     await msg.reply(f"{msg.user.display_name} flipped a coin and got: {'Heads' if result == 0 else 'Tails'}")
+    await message_to_audit_log(msg, action=f"coinflip_command_{'heads' if result == 0 else 'tails'}")
     return True
 
 # -----------------------------
@@ -503,6 +562,8 @@ async def on_ready(event: EventData) -> None:
     await event.chat.join_room(TARGET_CHANNEL)
 
 async def on_message(msg: ChatMessage) -> None:
+    await message_to_audit_log(msg) # initially log the message before any bot actions
+    
     if await handle_regular_command(msg):
         return
     if await handle_regular_remove_command(msg):
@@ -522,6 +583,7 @@ async def on_message(msg: ChatMessage) -> None:
         # mention what time it is for me
         now = datetime.now(ZoneInfo("Europe/London"))
         await msg.reply(f"For me the time is: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        await message_to_audit_log(msg, action="timezone_command")
 
     
 async def on_raid(data: ChannelRaidEvent) -> None:

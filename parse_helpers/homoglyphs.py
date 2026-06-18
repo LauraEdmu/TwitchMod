@@ -6,13 +6,22 @@ import re
 
 from confusable_homoglyphs import confusables
 
-ZERO_WIDTH = {
+ZERO_WIDTH_CHARS = (
     "\u200b",  # zero width space
     "\u200c",  # zero width non-joiner
     "\u200d",  # zero width joiner
     "\ufeff",  # zero width no-break space / BOM
     "\u2060",  # word joiner
-}
+)
+
+ZERO_WIDTH = set(ZERO_WIDTH_CHARS)
+
+
+def remove_zero_width(text: str) -> str:
+    if not any(ch in text for ch in ZERO_WIDTH_CHARS):
+        return text
+
+    return "".join(ch for ch in text if ch not in ZERO_WIDTH)
 
 ASCII_TARGETS = set(string.ascii_lowercase + string.digits)
 
@@ -66,7 +75,7 @@ PARENTHESISED_LETTER_RE = re.compile(r"\(([a-z])\)")
 
 def basic_normalise(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
-    text = "".join(ch for ch in text if ch not in ZERO_WIDTH)
+    text = remove_zero_width(text)
     return text.casefold()
 
 
@@ -128,12 +137,22 @@ def advanced_normalise(text: str, remove_parenthesised: bool = True) -> str:
     Intended for banned-word/spam matching, not for displaying user text.
     """
     text = basic_normalise(text)
+
+    if text.isascii():
+        if remove_parenthesised and "(" in text and ")" in text:
+            text = PARENTHESISED_LETTER_RE.sub(r"\1", text)
+        return text
+
     text = strip_combining_marks(text)
     text = text.translate(EXTRA_HOMOGLYPH_MAP)
     text = fold_confusables_to_ascii(text)
     text = unicodedata.normalize("NFKC", text)
+
     if remove_parenthesised:
-        text = PARENTHESISED_LETTER_RE.sub(r"\1", text) # remove parenthesised letters
+        # NFKC turns parenthesised letters like "⒜" into "(a)".
+        # For moderation matching, collapse those back to plain letters.
+        text = PARENTHESISED_LETTER_RE.sub(r"\1", text)
+
     return text.casefold()
 
 

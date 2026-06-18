@@ -58,6 +58,7 @@ if not logger.handlers:
 # -----------------------------
 
 TIMEZONE_REGEX = re.compile(r"\btime.?zones?\b", re.IGNORECASE)
+DISCORD_ASK_REGEX = re.compile(r"\bdiscord\?", re.IGNORECASE)
 
 APP_ID = os.environ["TWITCH_CLIENT_ID"]
 APP_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
@@ -68,6 +69,10 @@ BOT_LOGIN = os.getenv("TWITCH_BOT_LOGIN", "").lower()
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
 DATA_PATH = Path("user_data") / f"{TARGET_CHANNEL}.json"
+
+DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
+
+UK_TZ = ZoneInfo("Europe/London")
 
 # twitchAPI chat helper uses IRC chat scopes.
 # The timeout API needs MODERATOR_MANAGE_BANNED_USERS.
@@ -553,6 +558,22 @@ async def coinflip_command(msg: ChatMessage) -> bool:
     await message_to_audit_log(msg, action=f"coinflip_command_{'heads' if result == 0 else 'tails'}")
     return True
 
+async def handle_contextual_command(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    if TIMEZONE_REGEX.search(text):
+        now = datetime.now(UK_TZ)
+        await msg.reply(f"For me the time is: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        await message_to_audit_log(msg, action="timezone_command")
+        return True
+
+    if DISCORD_ASK_REGEX.search(text):
+        await msg.reply(f"You can join our Discord server here: {DISCORD_INVITE_LINK}")
+        await message_to_audit_log(msg, action="discord_command")
+        return True
+
+    return False
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------
@@ -563,7 +584,11 @@ async def on_ready(event: EventData) -> None:
 
 async def on_message(msg: ChatMessage) -> None:
     await message_to_audit_log(msg) # initially log the message before any bot actions
-    
+
+    normalized_text = advanced_normalise(msg.text)
+    if await handle_auto_moderation(msg, normalized_text):
+        return
+
     if await handle_regular_command(msg):
         return
     if await handle_regular_remove_command(msg):
@@ -574,18 +599,9 @@ async def on_message(msg: ChatMessage) -> None:
         return
     if await coinflip_command(msg):
         return
-    normalized_text = advanced_normalise(msg.text)
+        
+    await handle_contextual_command(msg)
 
-    if await handle_auto_moderation(msg, normalized_text):
-        return
-    
-    if TIMEZONE_REGEX.search(normalized_text):
-        # mention what time it is for me
-        now = datetime.now(ZoneInfo("Europe/London"))
-        await msg.reply(f"For me the time is: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        await message_to_audit_log(msg, action="timezone_command")
-
-    
 async def on_raid(data: ChannelRaidEvent) -> None:
     assert twitch is not None
     assert broadcaster_id is not None

@@ -90,9 +90,11 @@ SCOPES = [
 
 AUDITS_ACTIONS_PATH = Path("audits") / f"{TARGET_CHANNEL}_actions.json"
 AUDITS_MESSAGES_PATH = Path("audits") / f"{TARGET_CHANNEL}_messages.json"
+AUDITS_REDEEMS_PATH = Path("audits") / f"{TARGET_CHANNEL}_redeems.json"
 AUDITS_ACTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 audit_log_lock = asyncio.Lock()
+audit_redeem_lock = asyncio.Lock()
 
 COUNTDOWN_URL = os.environ.get(
     "COUNTDOWN_URL",
@@ -101,10 +103,24 @@ COUNTDOWN_URL = os.environ.get(
 
 COUNTDOWN_SECRET = os.environ["COUNTDOWN_SECRET"]
 
+reward_data_path = Path("reward_data") / f"{TARGET_CHANNEL}_rewards.json"
+reward_data_path.parent.mkdir(parents=True, exist_ok=True)
+
+if not reward_data_path.exists():
+    logger.warning(
+        "Reward data file does not exist: %s. "
+        "Please run the reward data collection script first.",
+        reward_data_path,
+    )
+    reward_data = {}
+else:
+    with open(reward_data_path, "r", encoding="utf-8") as f:
+        reward_data = json.load(f)
+
 CHANNEL_POINT_REWARD_SECONDS = {
-    "your-add-1-min-reward-id": 60,
-    "4483c5cc-d672-4436-a077-a06ab9027911": 300,
-    "your-add-10-min-reward-id": 600,
+    reward_data.get("add_minute", "1_min_id"): 60,
+    reward_data.get("add_5_minutes", "5_min_id"): 300,
+    reward_data.get("add_10_minutes", "10_min_id"): 600,
 }
 
 # -----------------------------
@@ -258,6 +274,40 @@ async def add_regular_by_login(login: str, added_by_msg: ChatMessage) -> tuple[b
 
     return True, f"{user.display_name} is now a regular."
 
+async def add_regular_from_redeem(user_id: str, user_name: str, event_id: str) -> tuple[bool, str]:
+    assert twitch is not None
+
+    users = [user async for user in twitch.get_users(user_ids=[user_id])]
+
+    if not users:
+        return False, f"Could not find Twitch user with ID: {user_id}"
+
+    user = users[0]
+
+    already_regular = user.id in regulars
+
+    regulars[user.id] = {
+        "login": user.login,
+        "display_name": user.display_name,
+        "added_by_id": user.id,
+        "added_by_name": f"{user.display_name} (via redeem {event_id})",
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    user_data["regulars"] = regulars
+    save_user_data()
+
+    logger.info(
+        "[REGULAR ADDED FROM REDEEM] %s (%s) by %s",
+        user.display_name,
+        user.id,
+        user.display_name,
+    )
+
+    if already_regular:
+        return True, f"{user.display_name} was already a regular; updated their record."
+
+    return True, f"{user.display_name} is now a regular."
 
 # -----------------------------
 # Permissions / protection
@@ -390,6 +440,36 @@ async def message_to_audit_log(msg: ChatMessage, action: str = "") -> None:
             entries.append(log_entry)
 
         async with aiofiles.open(AUDITS_MESSAGES_PATH, mode="w", encoding="utf-8") as f:
+            for entry in entries:
+                await f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+async def redeem_to_audit_log(redeem_event: ChannelPointsCustomRewardRedemptionAddEvent, action: str = "") -> None:
+    async with audit_redeem_lock:
+        log_entry = {
+            "redeem_id": redeem_event.event.id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reward_id": redeem_event.event.reward.id,
+            "reward_title": redeem_event.event.reward.title,
+            "user_id": redeem_event.event.user_id,
+            "user_name": redeem_event.event.user_name,
+            "user_input": redeem_event.event.user_input,
+            "action": [action] if action else [],
+        }
+
+        entries = []
+        if AUDITS_REDEEMS_PATH.exists():
+            async with aiofiles.open(AUDITS_REDEEMS_PATH, mode="r", encoding="utf-8") as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    entry = json.loads(line)
+                    entries.append(entry)
+
+        entries.append(log_entry)
+
+        async with aiofiles.open(AUDITS_REDEEMS_PATH, mode="w", encoding="utf-8") as f:
             for entry in entries:
                 await f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -664,56 +744,78 @@ async def on_raid(data: ChannelRaidEvent) -> None:
             raid.from_broadcaster_user_login,
         )
 
-async def on_channel_point_redeem(data: ChannelPointsCustomRewardRedemptionAddEvent) -> None:
+async def on_channel_point_redeem(
+    data: ChannelPointsCustomRewardRedemptionAddEvent,
+    chat: Chat,
+) -> None:
+    await redeem_to_audit_log(data, action="channel_point_redeem")
+    
     event = data.event
 
     seconds_to_add = CHANNEL_POINT_REWARD_SECONDS.get(event.reward.id)
     logger.info(f"Channel point redeem: {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r}, seconds to add: {seconds_to_add}")
 
-    if seconds_to_add is None:
-        logger.info(
-            f"Ignoring channel point redeem: {event.reward.title!r} "
-            f"with reward ID {event.reward.id!r}"
-        )
-        return
+    if seconds_to_add is not None:
+        payload = {
+            "redeem_id": event.id,
+            "reward_id": event.reward.id,
+            "reward_title": event.reward.title,
+            "user_id": event.user_id,
+            "user_name": event.user_name,
+            "seconds": seconds_to_add,
+            "user_input": event.user_input,
+        }
 
-    payload = {
-        "redeem_id": event.id,
-        "reward_id": event.reward.id,
-        "reward_title": event.reward.title,
-        "user_id": event.user_id,
-        "user_name": event.user_name,
-        "seconds": seconds_to_add,
-        "user_input": event.user_input,
-    }
+        headers = {
+            "X-Countdown-Secret": COUNTDOWN_SECRET,
+        }
 
-    headers = {
-        "X-Countdown-Secret": COUNTDOWN_SECRET,
-    }
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                response = await client.post(
+                    COUNTDOWN_URL,
+                    json=payload,
+                    headers=headers,
+                )
 
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.post(
-                COUNTDOWN_URL,
-                json=payload,
-                headers=headers,
+            response.raise_for_status()
+
+            logger.info(
+                f"Added {seconds_to_add}s to countdown from "
+                f"{event.user_name}'s redeem: {event.reward.title}"
             )
 
-        response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Countdown app rejected redeem POST: "
+                f"{e.response.status_code} {e.response.text}"
+            )
 
+        except httpx.RequestError as e:
+            logger.error(f"Could not reach countdown app: {e}")
+        await redeem_to_audit_log(data, action="countdown_post")
+    elif event.reward.id == reward_data.get("become_regular", "become_regular_id"):
         logger.info(
-            f"Added {seconds_to_add}s to countdown from "
-            f"{event.user_name}'s redeem: {event.reward.title}"
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Become Regular' redeem."
         )
-
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            f"Countdown app rejected redeem POST: "
-            f"{e.response.status_code} {e.response.text}"
+        await add_regular_from_redeem(event.user_id, event.user_name, event.id)
+        await redeem_to_audit_log(data, action="become_regular_redeem")
+        
+        if chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"Congratulations {event.user_name}! You are now a regular! 💃",
+            )
+        else:
+            logger.warning(
+                "Could not announce regular redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    else:
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) "
+            f"with reward ID {event.reward.id!r} does not have a configured seconds value."
         )
-
-    except httpx.RequestError as e:
-        logger.error(f"Could not reach countdown app: {e}")
 
 # -----------------------------
 # Main
@@ -746,6 +848,11 @@ async def main() -> None:
 
     chat.start()
 
+    async def on_channel_point_redeem_with_chat(
+        data: ChannelPointsCustomRewardRedemptionAddEvent,
+    ) -> None:
+        await on_channel_point_redeem(data, chat)
+
 
     eventsub = EventSubWebsocket(twitch)
     eventsub.start()
@@ -757,7 +864,7 @@ async def main() -> None:
 
     await eventsub.listen_channel_points_custom_reward_redemption_add(
         broadcaster_user_id=broadcaster_id,
-        callback=on_channel_point_redeem,
+        callback=on_channel_point_redeem_with_chat,
     )
 
     try:

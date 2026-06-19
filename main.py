@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 import aiofiles
+import httpx
 
 from dotenv import load_dotenv
 
@@ -18,7 +19,10 @@ from twitchAPI.oauth import UserAuthenticationStorageHelper
 from twitchAPI.twitch import Twitch
 from twitchAPI.type import AuthScope, ChatEvent
 from twitchAPI.eventsub.websocket import EventSubWebsocket
-from twitchAPI.object.eventsub import ChannelRaidEvent
+from twitchAPI.object.eventsub import (
+    ChannelRaidEvent,
+    ChannelPointsCustomRewardRedemptionAddEvent,
+)
 
 from parse_helpers.homoglyphs import advanced_normalise
 from parse_helpers.thisis import is_link, contains_non_twitch_link
@@ -81,6 +85,7 @@ SCOPES = [
     AuthScope.CHAT_EDIT,
     AuthScope.MODERATOR_MANAGE_BANNED_USERS,
     AuthScope.MODERATOR_MANAGE_SHOUTOUTS,
+    AuthScope.CHANNEL_READ_REDEMPTIONS
 ]
 
 AUDITS_ACTIONS_PATH = Path("audits") / f"{TARGET_CHANNEL}_actions.json"
@@ -88,6 +93,19 @@ AUDITS_MESSAGES_PATH = Path("audits") / f"{TARGET_CHANNEL}_messages.json"
 AUDITS_ACTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 audit_log_lock = asyncio.Lock()
+
+COUNTDOWN_URL = os.environ.get(
+    "COUNTDOWN_URL",
+    "http://YOUR_STREAMING_PC_IP:8765/redeem",
+)
+
+COUNTDOWN_SECRET = os.environ["COUNTDOWN_SECRET"]
+
+CHANNEL_POINT_REWARD_SECONDS = {
+    "your-add-1-min-reward-id": 60,
+    "4483c5cc-d672-4436-a077-a06ab9027911": 300,
+    "your-add-10-min-reward-id": 600,
+}
 
 # -----------------------------
 # Data models
@@ -646,6 +664,57 @@ async def on_raid(data: ChannelRaidEvent) -> None:
             raid.from_broadcaster_user_login,
         )
 
+async def on_channel_point_redeem(data: ChannelPointsCustomRewardRedemptionAddEvent) -> None:
+    event = data.event
+
+    seconds_to_add = CHANNEL_POINT_REWARD_SECONDS.get(event.reward.id)
+    logger.info(f"Channel point redeem: {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r}, seconds to add: {seconds_to_add}")
+
+    if seconds_to_add is None:
+        logger.info(
+            f"Ignoring channel point redeem: {event.reward.title!r} "
+            f"with reward ID {event.reward.id!r}"
+        )
+        return
+
+    payload = {
+        "redeem_id": event.id,
+        "reward_id": event.reward.id,
+        "reward_title": event.reward.title,
+        "user_id": event.user_id,
+        "user_name": event.user_name,
+        "seconds": seconds_to_add,
+        "user_input": event.user_input,
+    }
+
+    headers = {
+        "X-Countdown-Secret": COUNTDOWN_SECRET,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.post(
+                COUNTDOWN_URL,
+                json=payload,
+                headers=headers,
+            )
+
+        response.raise_for_status()
+
+        logger.info(
+            f"Added {seconds_to_add}s to countdown from "
+            f"{event.user_name}'s redeem: {event.reward.title}"
+        )
+
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"Countdown app rejected redeem POST: "
+            f"{e.response.status_code} {e.response.text}"
+        )
+
+    except httpx.RequestError as e:
+        logger.error(f"Could not reach countdown app: {e}")
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -684,6 +753,11 @@ async def main() -> None:
     await eventsub.listen_channel_raid(
         on_raid,
         to_broadcaster_user_id=broadcaster_id,
+    )
+
+    await eventsub.listen_channel_points_custom_reward_redemption_add(
+        broadcaster_user_id=broadcaster_id,
+        callback=on_channel_point_redeem,
     )
 
     try:

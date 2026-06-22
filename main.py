@@ -764,7 +764,7 @@ async def on_channel_point_redeem(
     data: ChannelPointsCustomRewardRedemptionAddEvent,
     chat: Chat,
 ) -> None:
-    await redeem_to_audit_log(data, action="channel_point_redeem")
+    await redeem_to_audit_log(data)
     
     event = data.event
 

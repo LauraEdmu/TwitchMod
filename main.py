@@ -443,7 +443,10 @@ async def message_to_audit_log(msg: ChatMessage, action: str = "") -> None:
             for entry in entries:
                 await f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-async def redeem_to_audit_log(redeem_event: ChannelPointsCustomRewardRedemptionAddEvent, action: str = "") -> None:
+async def redeem_to_audit_log(
+    redeem_event: ChannelPointsCustomRewardRedemptionAddEvent,
+    action: str = "",
+) -> None:
     async with audit_redeem_lock:
         log_entry = {
             "redeem_id": redeem_event.event.id,
@@ -457,6 +460,8 @@ async def redeem_to_audit_log(redeem_event: ChannelPointsCustomRewardRedemptionA
         }
 
         entries = []
+        found = False
+
         if AUDITS_REDEEMS_PATH.exists():
             async with aiofiles.open(AUDITS_REDEEMS_PATH, mode="r", encoding="utf-8") as f:
                 async for line in f:
@@ -465,9 +470,20 @@ async def redeem_to_audit_log(redeem_event: ChannelPointsCustomRewardRedemptionA
                         continue
 
                     entry = json.loads(line)
+
+                    if entry.get("redeem_id") == redeem_event.event.id:
+                        found = True
+
+                        if "action" not in entry or not isinstance(entry["action"], list):
+                            entry["action"] = []
+
+                        if action:
+                            entry["action"].append(action)
+
                     entries.append(entry)
 
-        entries.append(log_entry)
+        if not found:
+            entries.append(log_entry)
 
         async with aiofiles.open(AUDITS_REDEEMS_PATH, mode="w", encoding="utf-8") as f:
             for entry in entries:

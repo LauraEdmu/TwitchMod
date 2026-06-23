@@ -7,10 +7,11 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, TypeVar
 from zoneinfo import ZoneInfo
 import aiofiles
 import httpx
+from collections import deque
 
 from dotenv import load_dotenv
 
@@ -22,6 +23,9 @@ from twitchAPI.eventsub.websocket import EventSubWebsocket
 from twitchAPI.object.eventsub import (
     ChannelRaidEvent,
     ChannelPointsCustomRewardRedemptionAddEvent,
+    ChannelSharedChatBeginEvent,
+    ChannelSharedChatUpdateEvent,
+    ChannelSharedChatEndEvent,
 )
 
 from parse_helpers.homoglyphs import advanced_normalise
@@ -29,6 +33,7 @@ from parse_helpers.thisis import is_link, contains_non_twitch_link
 
 
 load_dotenv()
+T = TypeVar("T")
 
 
 # -----------------------------
@@ -75,6 +80,8 @@ DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 DATA_PATH = Path("user_data") / f"{TARGET_CHANNEL}.json"
 
 DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
+
+MAX_TIMEOUT_STACK_SIZE = int(os.getenv("MAX_TIMEOUT_STACK_SIZE", "5"))
 
 UK_TZ = ZoneInfo("Europe/London")
 
@@ -142,11 +149,39 @@ class Rule:
 twitch: Twitch | None = None
 broadcaster_id: str | None = None
 moderator_id: str | None = None
+shared_chat_session_id: str | None = None
 
 user_data: dict[str, Any] = {}
 regulars: dict[str, dict[str, Any]] = {}
 
+# -----------------------------
+# Helpers/ Wrappers
+# -----------------------------
 
+class LimitedStack(Generic[T]):
+    def __init__(self, max_size: int = MAX_TIMEOUT_STACK_SIZE) -> None:
+        self._items: deque[T] = deque(maxlen=max_size)
+
+    def push(self, item: T) -> None:
+        self._items.append(item)
+
+    def pop(self) -> T:
+        return self._items.pop()
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def to_list(self) -> list[T]:
+        return list(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self):
+        return iter(self._items)
+
+
+#
 # -----------------------------
 # Rules
 # -----------------------------
@@ -520,6 +555,60 @@ async def timeout_user(msg: ChatMessage, rule: Rule) -> None:
 
     logger.info("[TIMEOUT] %s for %ss", msg.user.name, rule.duration)
 
+async def timeout_user_by_id(user_id: str, reason: str, duration: int) -> None:
+    assert twitch is not None
+    assert broadcaster_id is not None
+    assert moderator_id is not None
+
+    logger.info("[TIMEOUT] user_id=%s -> reason=%r, duration=%ss", user_id, reason, duration)
+
+    if DRY_RUN:
+        logger.info("[DRY RUN] Not timing out.")
+        return
+
+    await twitch.ban_user(
+        broadcaster_id=broadcaster_id,
+        moderator_id=moderator_id,
+        user_id=user_id,
+        reason=reason,
+        duration=duration,
+    )
+
+async def ban_user(msg: ChatMessage, reason: str) -> None:
+    assert twitch is not None
+    assert broadcaster_id is not None
+    assert moderator_id is not None
+
+    logger.info("[BAN] %s: %r -> reason=%r", msg.user.name, msg.text, reason)
+
+    if DRY_RUN:
+        logger.info("[DRY RUN] Not banning.")
+        return
+
+    await twitch.ban_user(
+        broadcaster_id=broadcaster_id,
+        moderator_id=moderator_id,
+        user_id=msg.user.id,
+        reason=reason,
+    )
+
+async def ban_user_by_id(user_id: str, reason: str) -> None:
+    assert twitch is not None
+    assert broadcaster_id is not None
+    assert moderator_id is not None
+
+    logger.info("[BAN] user_id=%s -> reason=%r", user_id, reason)
+
+    if DRY_RUN:
+        logger.info("[DRY RUN] Not banning.")
+        return
+
+    await twitch.ban_user(
+        broadcaster_id=broadcaster_id,
+        moderator_id=moderator_id,
+        user_id=user_id,
+        reason=reason,
+    )
 
 # -----------------------------
 # Commands
@@ -693,6 +782,125 @@ async def handle_contextual_command(msg: ChatMessage) -> bool:
 
     return False
 
+async def timeout_stack_ban(msg: ChatMessage) -> None:
+    """
+    Ban the last N users from the timeout stack. Only mods can do this.
+    """
+    text = msg.text.strip()
+
+    command_aliases = ("!banstack", "!banstacked", "!banlast")
+
+    command_used = None
+    for alias in command_aliases:
+        if text == alias or text.startswith(alias + " "):
+            command_used = alias
+            break
+
+    if command_used is None:
+        return
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_command")
+        return
+
+    parts = text.split(maxsplit=1)
+
+    if len(parts) < 2:
+        await msg.reply(f"Usage: !banstack number_of_users_to_ban (1-{MAX_TIMEOUT_STACK_SIZE})")
+        return
+
+    try:
+        num_to_ban = int(parts[1])
+    except ValueError:
+        await msg.reply("Please provide a valid number.")
+        return
+
+    if num_to_ban < 1 or num_to_ban > MAX_TIMEOUT_STACK_SIZE:
+        await msg.reply(f"Please provide a number between 1 and {MAX_TIMEOUT_STACK_SIZE}.")
+        return
+
+    users_to_ban = []
+    for _ in range(num_to_ban):
+        if len(timeout_stack) == 0:
+            break
+        users_to_ban.append(timeout_stack.pop())
+    
+    if not users_to_ban:
+        await msg.reply("Timeout stack is empty.")
+        return
+
+    for user_id in users_to_ban:
+        if DRY_RUN:
+            logger.info("[DRY RUN] Would ban user ID: %s", user_id)
+            continue
+        
+        await ban_user_by_id(user_id, reason="Banned from timeout stack")
+        logger.info("[BAN STACK] Banning user ID: %s", user_id)
+        await message_to_audit_log(msg, action=f"ban_stack_{user_id}")
+
+    await msg.reply(f"Banned the last {len(users_to_ban)} users from the timeout stack.")
+
+async def clear_timeout_stack(msg: ChatMessage) -> None:
+    """
+    Clear the timeout stack. Only mods can do this.
+    """
+    text = msg.text.strip()
+
+    command_aliases = ("!cleartimeoutstack", "!cleartstack", "!clearstack")
+
+    command_used = None
+    for alias in command_aliases:
+        if text == alias or text.startswith(alias + " "):
+            command_used = alias
+            break
+
+    if command_used is None:
+        return
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_command")
+        return
+
+    timeout_stack.clear()
+    await msg.reply("Timeout stack has been cleared.")
+    await message_to_audit_log(msg, action="clear_timeout_stack")
+
+async def check_timeout_stack(msg: ChatMessage) -> None:
+    """
+    Check the contents of the timeout stack. Only mods can do this.
+    """
+    text = msg.text.strip()
+
+    command_aliases = ("!checktimeoutstack", "!checktstack", "!checkstack")
+
+    command_used = None
+    for alias in command_aliases:
+        if text == alias or text.startswith(alias + " "):
+            command_used = alias
+            break
+
+    if command_used is None:
+        return
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_command")
+        return
+
+    if len(timeout_stack) == 0:
+        await msg.reply("Timeout stack is empty.")
+        return
+
+    user_ids = timeout_stack.to_list()
+    await msg.reply(f"Timeout stack contains the following user IDs: {', '.join(user_ids)}")
+    await message_to_audit_log(msg, action="check_timeout_stack")
+    
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------
@@ -706,6 +914,7 @@ async def on_message(msg: ChatMessage) -> None:
 
     normalized_text = advanced_normalise(msg.text)
     if await handle_auto_moderation(msg, normalized_text):
+        timeout_stack.push(msg.user.id)
         return
 
     if await handle_regular_command(msg):
@@ -717,6 +926,12 @@ async def on_message(msg: ChatMessage) -> None:
     if await lurk_announcement(msg):
         return
     if await coinflip_command(msg):
+        return
+    if await check_timeout_stack(msg):
+        return
+    if await clear_timeout_stack(msg):
+        return
+    if await timeout_stack_ban(msg):
         return
         
     await handle_contextual_command(msg)
@@ -833,6 +1048,68 @@ async def on_channel_point_redeem(
             f"with reward ID {event.reward.id!r} does not have a configured seconds value."
         )
 
+
+async def on_shared_chat_begin(event: ChannelSharedChatBeginEvent, chat: Chat) -> None:
+    global shared_chat_session_id
+
+    data = event.event
+    shared_chat_session_id = data.session_id
+
+    participants = ", ".join(
+        p.broadcaster_user_login
+        for p in data.participants
+    )
+
+    logger.info(
+        "Shared chat started: session=%s host=%s participants=%s",
+        data.session_id,
+        data.host_broadcaster_user_login,
+        participants,
+    )
+
+    await announce(chat, f"Shared chat started! Host: {data.host_broadcaster_user_login}. Participants: {participants}")
+
+
+async def on_shared_chat_update(event: ChannelSharedChatUpdateEvent, chat: Chat) -> None:
+    data = event.event
+
+    participants = ", ".join(
+        p.broadcaster_user_login
+        for p in data.participants
+    )
+
+    logger.info(
+        "Shared chat updated: session=%s host=%s participants=%s",
+        data.session_id,
+        data.host_broadcaster_user_login,
+        participants,
+    )
+
+    await announce(chat, f"Shared chat updated! Host: {data.host_broadcaster_user_login}. Participants: {participants}")
+
+
+async def on_shared_chat_end(event: ChannelSharedChatEndEvent, chat: Chat) -> None:
+    global shared_chat_session_id
+
+    data = event.event
+
+    logger.info(
+        "Shared chat ended: session=%s host=%s",
+        data.session_id,
+        data.host_broadcaster_user_login,
+    )
+
+    if shared_chat_session_id == data.session_id:
+        shared_chat_session_id = None
+    
+    await announce(chat, f"Shared chat ended! Host: {data.host_broadcaster_user_login}.")
+
+async def announce(chat: Chat, message: str) -> None:
+    if chat.is_ready():
+        await chat.send_message(TARGET_CHANNEL, message)
+    else:
+        logger.warning("Could not announce because chat is not ready: %s", message)
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -841,6 +1118,9 @@ async def main() -> None:
     global twitch
     global broadcaster_id
     global moderator_id
+    global timeout_stack
+
+    timeout_stack = LimitedStack[str](max_size=MAX_TIMEOUT_STACK_SIZE)
 
     load_user_data()
 
@@ -881,6 +1161,36 @@ async def main() -> None:
     await eventsub.listen_channel_points_custom_reward_redemption_add(
         broadcaster_user_id=broadcaster_id,
         callback=on_channel_point_redeem_with_chat,
+    )
+
+    async def on_shared_chat_begin_with_chat(
+        event: ChannelSharedChatBeginEvent,
+    ) -> None:
+        await on_shared_chat_begin(event, chat)
+
+    async def on_shared_chat_update_with_chat(
+        event: ChannelSharedChatUpdateEvent,
+    ) -> None:
+        await on_shared_chat_update(event, chat)
+
+    async def on_shared_chat_end_with_chat(
+        event: ChannelSharedChatEndEvent,
+    ) -> None:
+        await on_shared_chat_end(event, chat)
+
+    await eventsub.listen_channel_shared_chat_begin(
+        broadcaster_user_id=broadcaster_id,
+        callback=on_shared_chat_begin_with_chat,
+    )
+
+    await eventsub.listen_channel_shared_chat_update(
+        broadcaster_user_id=broadcaster_id,
+        callback=on_shared_chat_update_with_chat,
+    )
+
+    await eventsub.listen_channel_shared_chat_end(
+        broadcaster_user_id=broadcaster_id,
+        callback=on_shared_chat_end_with_chat,
     )
 
     try:

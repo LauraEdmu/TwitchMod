@@ -3,6 +3,7 @@ diagnostic/
 *.json
 .venv
 **\__pycache__
-main_logs/
+main_logs/*.log
+main_logs/*.zstd
 user_data/
 benchmark/

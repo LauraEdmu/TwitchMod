@@ -85,6 +85,14 @@ MAX_TIMEOUT_STACK_SIZE = int(os.getenv("MAX_TIMEOUT_STACK_SIZE", "5"))
 
 UK_TZ = ZoneInfo("Europe/London")
 
+REDEEM_TIMERS_SECONDS = {
+    "short": 60,
+    "medium": 330,
+    "long": 630,
+    "glasses_off": 330,
+    "sensitivity": 330,
+}
+
 # twitchAPI chat helper uses IRC chat scopes.
 # The timeout API needs MODERATOR_MANAGE_BANNED_USERS.
 SCOPES = [
@@ -157,6 +165,23 @@ regulars: dict[str, dict[str, Any]] = {}
 # -----------------------------
 # Helpers/ Wrappers
 # -----------------------------
+
+async def redeem_timer(chat, target_channel: str, duration: str = "medium", finished_text: str = "") -> None:
+    try:
+        await asyncio.sleep(REDEEM_TIMERS_SECONDS[duration])
+
+        await chat.send_message(
+            target_channel,
+            finished_text or f"Timer done! {REDEEM_TIMERS_SECONDS[duration]} seconds have elapsed."
+        )
+
+    except asyncio.CancelledError:
+        # Only needed if you later add cancellation/reset logic
+        logger.info("Redeem timer was cancelled.")
+        raise
+
+    except Exception:
+        logger.exception("Redeem timer failed.")
 
 class LimitedStack(Generic[T]):
     def __init__(self, max_size: int = MAX_TIMEOUT_STACK_SIZE) -> None:
@@ -1040,6 +1065,40 @@ async def on_channel_point_redeem(
         else:
             logger.warning(
                 "Could not announce regular redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    elif event.reward.id == reward_data.get("glasses_off", "glasses_off_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Glasses Off' redeem."
+        )
+        await redeem_to_audit_log(data, action="glasses_off_redeem")
+        
+        if chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"{event.user_name} has redeemed 'Glasses Off'! Starting 5 minute timer! ⏱️",
+            )
+            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="glasses_off", finished_text=f"{event.user_name}'s 'Glasses Off' timer is done! 5 minutes have elapsed."))
+        else:
+            logger.warning(
+                "Could not announce 'Glasses Off' redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    elif event.reward.id == reward_data.get("sensitivity", "sensitivity_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Sensitivity' redeem."
+        )
+        await redeem_to_audit_log(data, action="sensitivity_redeem")
+        
+        if chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"{event.user_name} has redeemed 'Sensitivity'! Starting 5 minute timer! ⏱️",
+            )
+            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="sensitivity", finished_text=f"{event.user_name}'s 'Sensitivity' timer is done! 5 minutes have elapsed."))
+        else:
+            logger.warning(
+                "Could not announce 'Sensitivity' redeem for %s because chat is not ready.",
                 event.user_name,
             )
     else:

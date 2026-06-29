@@ -168,16 +168,35 @@ regulars: dict[str, dict[str, Any]] = {}
 # Helpers/ Wrappers
 # -----------------------------
 
-async def send_tts_message(user_input: str) -> None:
+async def send_tts_message(user_input: str) -> tuple[bool, str]:
     """
     Send a TTS message to env: $TTS_ADDRESS with $TTS_SECRET in the header.
     """
     tts_address = os.environ.get("TTS_ADDRESS")
     tts_secret = os.environ.get("TTS_SECRET")
 
+    char_count = len(user_input)
+    word_count = len(user_input.split())
+
     if not tts_address or not tts_secret:
         logger.warning("TTS_ADDRESS or TTS_SECRET not set; skipping TTS message.")
-        return
+        return False, "TTS_ADDRESS or TTS_SECRET not set"
+
+    normalised_input = advanced_normalise(user_input)
+    rule_match = find_matching_rule(normalised_input)
+    if rule_match:
+        logger.info(
+            "TTS message matches rule %r; skipping TTS message.",
+            rule_match.name,
+        )
+        return False, f"TTS message matches rule {rule_match.name}; skipping TTS message."
+    elif char_count > 200 or word_count > 40:
+        logger.info(
+            "TTS message is too long (%d characters, %d words); skipping TTS message.",
+            char_count,
+            word_count,
+        )
+        return False, f"TTS message is too long ({char_count} characters, {word_count} words); skipping TTS message."
 
     payload = {
         "text": user_input,
@@ -198,15 +217,17 @@ async def send_tts_message(user_input: str) -> None:
         response.raise_for_status()
 
         logger.info("Sent TTS message: %r", user_input)
-
+        return True, "TTS message sent successfully."
     except httpx.HTTPStatusError as e:
         logger.error(
             f"TTS service rejected request: "
             f"{e.response.status_code} {e.response.text}"
         )
+        return False, f"TTS service rejected request: {e.response.status_code} {e.response.text}"
 
     except httpx.RequestError as e:
         logger.error(f"Could not reach TTS service: {e}")
+        return False, f"Could not reach TTS service: {e}"
 
 async def redeem_timer(chat, target_channel: str, duration: str = "medium", finished_text: str = "") -> None:
     try:
@@ -1120,9 +1141,9 @@ async def on_channel_point_redeem(
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
-                f"{event.user_name} has redeemed 'Glasses Off'! Starting 5 minute timer! ⏱️",
+                f"{event.user_name} has redeemed 'Glasses Off'! Starting 5 minute 30 second timer",
             )
-            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="glasses_off", finished_text=f"{event.user_name}'s 'Glasses Off' timer is done! 5 minutes have elapsed."))
+            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="glasses_off", finished_text=f"{event.user_name}'s 'Glasses Off' timer is done!"))
         else:
             logger.warning(
                 "Could not announce 'Glasses Off' redeem for %s because chat is not ready.",
@@ -1137,9 +1158,9 @@ async def on_channel_point_redeem(
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
-                f"{event.user_name} has redeemed 'Sensitivity'! Starting 5 minute timer! ⏱️",
+                f"{event.user_name} has redeemed 'Sensitivity'! Starting 5 minute 30 second timer",
             )
-            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="sensitivity", finished_text=f"{event.user_name}'s 'Sensitivity' timer is done! 5 minutes have elapsed."))
+            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="sensitivity", finished_text=f"{event.user_name}'s 'Sensitivity' timer is done!"))
         else:
             logger.warning(
                 "Could not announce 'Sensitivity' redeem for %s because chat is not ready.",
@@ -1154,9 +1175,9 @@ async def on_channel_point_redeem(
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
-                f"{event.user_name} has redeemed 'In-Game Action'! You cannot {event.user_input} for 5 minutes. Timer set! ⏱️",
+                f"{event.user_name} has redeemed 'In-Game Action'! You cannot \"{event.user_input}\" for 5 minutes. Timer set!",
             )
-            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="in_game_action", finished_text=f"{event.user_name}'s 'In-Game Action' ({event.user_input}) timer is done! 5 minutes have elapsed."))
+            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="in_game_action", finished_text=f"{event.user_name}'s 'In-Game Action' ({event.user_input}) timer is done!"))
         else:
             logger.warning(
                 "Could not announce 'In-Game Action' redeem for %s because chat is not ready.",
@@ -1171,9 +1192,9 @@ async def on_channel_point_redeem(
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
-                f"{event.user_name} has redeemed 'Ban Word'! The word '{event.user_input}' is now banned for 5 minutes. Timer set! ⏱️",
+                f"{event.user_name} has redeemed 'Ban Word'! The word '{event.user_input}' is now banned for 5 minutes. Timer set!",
             )
-            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="ban_word", finished_text=f"{event.user_name}'s 'Ban Word' ({event.user_input}) timer is done! 5 minutes have elapsed."))
+            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="ban_word", finished_text=f"{event.user_name}'s 'Ban Word' ({event.user_input}) timer is done!"))
         else:
             logger.warning(
                 "Could not announce 'Ban Word' redeem for %s because chat is not ready.",
@@ -1190,7 +1211,13 @@ async def on_channel_point_redeem(
                 TARGET_CHANNEL,
                 f"{event.user_name} has redeemed 'TTS'!",
             )
-            await send_tts_message(event.user_input)
+            success, message = await send_tts_message(event.user_input)
+            if not success:
+                logger.warning("TTS message failed: %s", message)
+                await chat.send_message(
+                    TARGET_CHANNEL,
+                    f"TTS message failed: {message}"
+                )
         else:
             logger.warning(
                 "Could not announce 'TTS' redeem for %s because chat is not ready.",

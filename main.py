@@ -91,6 +91,8 @@ REDEEM_TIMERS_SECONDS = {
     "long": 630,
     "glasses_off": 330,
     "sensitivity": 330,
+    "in_game_action": 330,
+    "ban_word": 330,
 }
 
 # twitchAPI chat helper uses IRC chat scopes.
@@ -166,14 +168,56 @@ regulars: dict[str, dict[str, Any]] = {}
 # Helpers/ Wrappers
 # -----------------------------
 
+async def send_tts_message(user_input: str) -> None:
+    """
+    Send a TTS message to env: $TTS_ADDRESS with $TTS_SECRET in the header.
+    """
+    tts_address = os.environ.get("TTS_ADDRESS")
+    tts_secret = os.environ.get("TTS_SECRET")
+
+    if not tts_address or not tts_secret:
+        logger.warning("TTS_ADDRESS or TTS_SECRET not set; skipping TTS message.")
+        return
+
+    payload = {
+        "text": user_input,
+    }
+
+    headers = {
+        "X-TTS-Secret": tts_secret,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.post(
+                tts_address,
+                json=payload,
+                headers=headers,
+            )
+
+        response.raise_for_status()
+
+        logger.info("Sent TTS message: %r", user_input)
+
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"TTS service rejected request: "
+            f"{e.response.status_code} {e.response.text}"
+        )
+
+    except httpx.RequestError as e:
+        logger.error(f"Could not reach TTS service: {e}")
+
 async def redeem_timer(chat, target_channel: str, duration: str = "medium", finished_text: str = "") -> None:
     try:
+        logger.info(f"Starting redeem timer for {duration} seconds in channel {target_channel}.")
         await asyncio.sleep(REDEEM_TIMERS_SECONDS[duration])
 
         await chat.send_message(
             target_channel,
             finished_text or f"Timer done! {REDEEM_TIMERS_SECONDS[duration]} seconds have elapsed."
         )
+        logger.info(f"Redeem timer for {duration} seconds in channel {target_channel} finished.")
 
     except asyncio.CancelledError:
         # Only needed if you later add cancellation/reset logic
@@ -1099,6 +1143,57 @@ async def on_channel_point_redeem(
         else:
             logger.warning(
                 "Could not announce 'Sensitivity' redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    elif event.reward.id == reward_data.get("in_game_action", "in_game_action_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is an 'In-Game Action' redeem."
+        )
+        await redeem_to_audit_log(data, action="in_game_action_redeem")
+        
+        if chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"{event.user_name} has redeemed 'In-Game Action'! You cannot {event.user_input} for 5 minutes. Timer set! ⏱️",
+            )
+            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="in_game_action", finished_text=f"{event.user_name}'s 'In-Game Action' ({event.user_input}) timer is done! 5 minutes have elapsed."))
+        else:
+            logger.warning(
+                "Could not announce 'In-Game Action' redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    elif event.reward.id == reward_data.get("ban_word", "ban_word_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Ban Word' redeem."
+        )
+        await redeem_to_audit_log(data, action="ban_word_redeem")
+        
+        if chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"{event.user_name} has redeemed 'Ban Word'! The word '{event.user_input}' is now banned for 5 minutes. Timer set! ⏱️",
+            )
+            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="ban_word", finished_text=f"{event.user_name}'s 'Ban Word' ({event.user_input}) timer is done! 5 minutes have elapsed."))
+        else:
+            logger.warning(
+                "Could not announce 'Ban Word' redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    elif event.reward.id == reward_data.get("tts", "tts_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'TTS' redeem."
+        )
+        await redeem_to_audit_log(data, action="tts_redeem")
+        
+        if chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"{event.user_name} has redeemed 'TTS'!",
+            )
+            await send_tts_message(event.user_input)
+        else:
+            logger.warning(
+                "Could not announce 'TTS' redeem for %s because chat is not ready.",
                 event.user_name,
             )
     else:

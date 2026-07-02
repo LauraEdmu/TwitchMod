@@ -168,6 +168,58 @@ regulars: dict[str, dict[str, Any]] = {}
 # Helpers/ Wrappers
 # -----------------------------
 
+async def handle_check_in_redeem(user_id: str, user_name: str = "") -> int:
+    """
+    Increment and save a user's check-in count.
+
+    Stored shape:
+    {
+        "checkin": {
+            "123456789": 1,
+            "987654321": 12
+        }
+    }
+
+    Note: JSON object keys are always strings after loading,
+    so the user id is stored as a string key, while the day count is an int.
+    """
+    checkin = user_data.setdefault("checkin", {})
+
+    if not isinstance(checkin, dict):
+        logger.warning("checkin was not a dict; resetting it.")
+        checkin = {}
+        user_data["checkin"] = checkin
+
+    user_id_key = str(user_id)
+
+    current_days_raw = checkin.get(user_id_key, 0)
+
+    try:
+        current_days = int(current_days_raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid check-in count for %s: %r; resetting to 0.",
+            user_id_key,
+            current_days_raw,
+        )
+        current_days = 0
+
+    new_days = current_days + 1
+    checkin[user_id_key] = new_days
+
+    save_user_data()
+
+    logger.info(
+        "[CHECK-IN] %s (%s) checked in for day %d",
+        user_name or "<unknown>",
+        user_id_key,
+        new_days,
+    )
+
+    return new_days
+
+
+
 async def send_tts_message(user_input: str) -> tuple[bool, str]:
     """
     Send a TTS message to env: $TTS_ADDRESS with $TTS_SECRET in the header.
@@ -1221,6 +1273,24 @@ async def on_channel_point_redeem(
         else:
             logger.warning(
                 "Could not announce 'TTS' redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    elif event.reward.id == reward_data.get("check_in", "check_in_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Check-In' redeem."
+        )
+        await redeem_to_audit_log(data, action="check_in_redeem")
+
+        day_num = await handle_check_in_redeem(event.user_id, event.user_name)
+        
+        if chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"{event.user_name} has redeemed 'Check-In'! Thanks for checking in! Day {day_num}."
+            )
+        else:
+            logger.warning(
+                "Could not announce 'Check-In' redeem for %s because chat is not ready.",
                 event.user_name,
             )
     else:

@@ -102,6 +102,7 @@ SCOPES = [
     AuthScope.MODERATOR_MANAGE_BANNED_USERS,
     AuthScope.MODERATOR_MANAGE_SHOUTOUTS,
     AuthScope.CHANNEL_READ_REDEMPTIONS,
+    AuthScope.CHANNEL_MANAGE_VIPS,
 ]
 
 AUDITS_ACTIONS_PATH = Path("audits") / f"{TARGET_CHANNEL}_actions.json"
@@ -178,12 +179,92 @@ regulars: dict[str, dict[str, Any]] = {}
 # -----------------------------
 
 
+async def get_shoutout_channel_info(
+    login: str,
+) -> tuple[str, str, str | None] | None:
+    """
+    Return the canonical login, display name, and current/last category.
+    """
+    assert twitch is not None
+
+    users = [user async for user in twitch.get_users(logins=[login])]
+
+    if not users:
+        return None
+
+    user = users[0]
+
+    channels = await twitch.get_channel_information(user.id)
+
+    category: str | None = None
+
+    if channels:
+        category = channels[0].game_name.strip() or None
+
+    return user.login, user.display_name, category
+
+
 def ordinal(n: int) -> str:
     if 10 <= n % 100 <= 20:
         suffix = "th"
     else:
         suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{n}{suffix}"
+
+
+async def handle_vip_redeem(user_id: str, user_name: str = "") -> bool:
+    assert twitch is not None
+    assert broadcaster_id is not None
+
+    display_name = user_name or user_id
+
+    if DRY_RUN:
+        logger.info(
+            "[DRY RUN] Would give VIP to %s (%s)",
+            display_name,
+            user_id,
+        )
+        return False
+
+    try:
+        added = await twitch.add_channel_vip(
+            broadcaster_id=broadcaster_id,
+            user_id=user_id,
+        )
+    except ValueError:
+        # pyTwitchAPI raises ValueError for things such as:
+        # - no available VIP slots
+        # - Build a Community not completed
+        logger.exception(
+            "[VIP FAILED] Could not give VIP to %s (%s)",
+            display_name,
+            user_id,
+        )
+        return False
+    except Exception:
+        logger.exception(
+            "[VIP FAILED] Unexpected error while giving VIP to %s (%s)",
+            display_name,
+            user_id,
+        )
+        return False
+
+    if not added:
+        # pyTwitchAPI returns False when the user is already a VIP
+        # or is currently a moderator.
+        logger.warning(
+            "[VIP NOT ADDED] %s (%s) is already a VIP or is a moderator",
+            display_name,
+            user_id,
+        )
+        return False
+
+    logger.info(
+        "[VIP ADDED] %s (%s)",
+        display_name,
+        user_id,
+    )
+    return True
 
 
 async def handle_check_in_redeem(user_id: str, user_name: str = "") -> int:
@@ -1116,27 +1197,63 @@ async def handle_shoutout_command(msg: ChatMessage) -> bool:
         return True
 
     target_login = clean_login(parts[1])
+    lookup_login = target_login
     shoutout_info = shoutouts.get(target_login)
 
+    # Resolve stored aliases to the real Twitch login.
     if shoutout_info and shoutout_info.get("isAlias"):
         alias_target = shoutout_info.get("aliasFor")
-        if alias_target and alias_target in shoutouts:
-            shoutout_info = shoutouts[alias_target]
+
+        if isinstance(alias_target, str):
+            lookup_login = clean_login(alias_target)
+            shoutout_info = shoutouts.get(lookup_login)
         else:
             shoutout_info = None
 
-    if shoutout_info:
-        shoutout_number = shoutout_info.get("shoutout_number", 0) if shoutout_info else 0
-        shoutout_number += 1
-        shoutout_info["shoutout_number"] = shoutout_number
-        response = f"Shoutout to {shoutout_info['display_name']}! {shoutout_info['message']} | This is their {ordinal(shoutout_number)} shoutout!"
+    try:
+        channel_info = await get_shoutout_channel_info(lookup_login)
+    except Exception:
+        logger.exception(
+            "[SHOUTOUT] Failed to retrieve channel information for %s",
+            lookup_login,
+        )
+        channel_info = None
+
+    if channel_info is not None:
+        channel_login, api_display_name, category = channel_info
     else:
-        response = f"Shoutout to {target_login}! Check them out!"
+        channel_login = lookup_login
+        api_display_name = lookup_login
+        category = None
+
+    category_text = f" Their latest category was {category}!" if category else ""
+
+    if shoutout_info:
+        shoutout_number = int(shoutout_info.get("shoutout_number", 0)) + 1
+
+        shoutout_info["shoutout_number"] = shoutout_number
+
+        display_name = shoutout_info.get(
+            "display_name",
+            api_display_name,
+        )
+        custom_message = shoutout_info.get("message", "").strip()
+
+        response = (
+            f"Shoutout to {display_name}! "
+            f"{custom_message}{category_text} | "
+            f"https://www.twitch.tv/{channel_login} | "
+            f"This is their {ordinal(shoutout_number)} shoutout!"
+        )
+    else:
+        response = (
+            f"Shoutout to {api_display_name}! Check them out!{category_text} | https://www.twitch.tv/{channel_login}"
+        )
 
     await msg.reply(response)
     await message_to_audit_log(msg, action="shoutout_command")
 
-    save_shoutouts()  # Save shoutouts after updating
+    save_shoutouts()
 
     return True
 
@@ -1417,10 +1534,30 @@ async def on_channel_point_redeem(
                 "Could not announce 'Check-In' redeem for %s because chat is not ready.",
                 event.user_name,
             )
+    elif event.reward.id == reward_data.get("vip", "vip_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'VIP' redeem."
+        )
+        await redeem_to_audit_log(data, action="vip_redeem")
+
+        success = await handle_vip_redeem(event.user_id, event.user_name)
+
+        if chat.is_ready():
+            if success:
+                await chat.send_message(
+                    TARGET_CHANNEL, f"{event.user_name} has redeemed 'VIP'! Congratulations on becoming a VIP!"
+                )
+            else:
+                await chat.send_message(TARGET_CHANNEL, f"{event.user_name}'s VIP redeem failed.")
+        else:
+            logger.warning(
+                "Could not announce 'VIP' redeem for %s because chat is not ready.",
+                event.user_name,
+            )
     else:
         logger.info(
             f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) "
-            f"with reward ID {event.reward.id!r} does not have a configured seconds value."
+            f"with reward ID {event.reward.id!r} does not have a specific action defined. No action will be taken."
         )
 
 

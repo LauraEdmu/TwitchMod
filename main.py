@@ -2,35 +2,33 @@ import asyncio
 import json
 import logging
 import os
-import re
 import random
+import re
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 from zoneinfo import ZoneInfo
+
 import aiofiles
 import httpx
-from collections import deque
-
 from dotenv import load_dotenv
-
 from twitchAPI.chat import Chat, ChatMessage, EventData
+from twitchAPI.eventsub.websocket import EventSubWebsocket
 from twitchAPI.oauth import UserAuthenticationStorageHelper
+from twitchAPI.object.eventsub import (
+    ChannelPointsCustomRewardRedemptionAddEvent,
+    ChannelRaidEvent,
+    ChannelSharedChatBeginEvent,
+    ChannelSharedChatEndEvent,
+    ChannelSharedChatUpdateEvent,
+)
 from twitchAPI.twitch import Twitch
 from twitchAPI.type import AuthScope, ChatEvent
-from twitchAPI.eventsub.websocket import EventSubWebsocket
-from twitchAPI.object.eventsub import (
-    ChannelRaidEvent,
-    ChannelPointsCustomRewardRedemptionAddEvent,
-    ChannelSharedChatBeginEvent,
-    ChannelSharedChatUpdateEvent,
-    ChannelSharedChatEndEvent,
-)
 
 from parse_helpers.homoglyphs import advanced_normalise
-from parse_helpers.thisis import is_link, contains_non_twitch_link
-
+from parse_helpers.thisis import contains_non_twitch_link, is_link
 
 load_dotenv()
 T = TypeVar("T")
@@ -78,6 +76,7 @@ BOT_LOGIN = os.getenv("TWITCH_BOT_LOGIN", "").lower()
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
 DATA_PATH = Path("user_data") / f"{TARGET_CHANNEL}.json"
+SHOUTOUTS_PATH = Path("user_data") / "shoutouts.json"
 
 DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
 
@@ -102,7 +101,7 @@ SCOPES = [
     AuthScope.CHAT_EDIT,
     AuthScope.MODERATOR_MANAGE_BANNED_USERS,
     AuthScope.MODERATOR_MANAGE_SHOUTOUTS,
-    AuthScope.CHANNEL_READ_REDEMPTIONS
+    AuthScope.CHANNEL_READ_REDEMPTIONS,
 ]
 
 AUDITS_ACTIONS_PATH = Path("audits") / f"{TARGET_CHANNEL}_actions.json"
@@ -125,14 +124,23 @@ reward_data_path.parent.mkdir(parents=True, exist_ok=True)
 
 if not reward_data_path.exists():
     logger.warning(
-        "Reward data file does not exist: %s. "
-        "Please run the reward data collection script first.",
+        "Reward data file does not exist: %s. Please run the reward data collection script first.",
         reward_data_path,
     )
     reward_data = {}
 else:
     with open(reward_data_path, "r", encoding="utf-8") as f:
         reward_data = json.load(f)
+
+if not SHOUTOUTS_PATH.exists():
+    logger.warning(
+        "Shoutouts file does not exist: %s.",
+        SHOUTOUTS_PATH,
+    )
+    shoutouts = {}
+else:
+    with open(SHOUTOUTS_PATH, "r", encoding="utf-8") as f:
+        shoutouts = json.load(f)
 
 CHANNEL_POINT_REWARD_SECONDS = {
     reward_data.get("add_minute", "1_min_id"): 60,
@@ -143,6 +151,7 @@ CHANNEL_POINT_REWARD_SECONDS = {
 # -----------------------------
 # Data models
 # -----------------------------
+
 
 @dataclass
 class Rule:
@@ -167,6 +176,15 @@ regulars: dict[str, dict[str, Any]] = {}
 # -----------------------------
 # Helpers/ Wrappers
 # -----------------------------
+
+
+def ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
 
 async def handle_check_in_redeem(user_id: str, user_name: str = "") -> int:
     """
@@ -217,7 +235,6 @@ async def handle_check_in_redeem(user_id: str, user_name: str = "") -> int:
     )
 
     return new_days
-
 
 
 async def send_tts_message(user_input: str) -> tuple[bool, str]:
@@ -271,15 +288,13 @@ async def send_tts_message(user_input: str) -> tuple[bool, str]:
         logger.info("Sent TTS message: %r", user_input)
         return True, "TTS message sent successfully."
     except httpx.HTTPStatusError as e:
-        logger.error(
-            f"TTS service rejected request: "
-            f"{e.response.status_code} {e.response.text}"
-        )
+        logger.error(f"TTS service rejected request: {e.response.status_code} {e.response.text}")
         return False, f"TTS service rejected request: {e.response.status_code} {e.response.text}"
 
     except httpx.RequestError as e:
         logger.error(f"Could not reach TTS service: {e}")
         return False, f"Could not reach TTS service: {e}"
+
 
 async def redeem_timer(chat, target_channel: str, duration: str = "medium", finished_text: str = "") -> None:
     try:
@@ -287,8 +302,7 @@ async def redeem_timer(chat, target_channel: str, duration: str = "medium", fini
         await asyncio.sleep(REDEEM_TIMERS_SECONDS[duration])
 
         await chat.send_message(
-            target_channel,
-            finished_text or f"Timer done! {REDEEM_TIMERS_SECONDS[duration]} seconds have elapsed."
+            target_channel, finished_text or f"Timer done! {REDEEM_TIMERS_SECONDS[duration]} seconds have elapsed."
         )
         logger.info(f"Redeem timer for {duration} seconds in channel {target_channel} finished.")
 
@@ -299,6 +313,7 @@ async def redeem_timer(chat, target_channel: str, duration: str = "medium", fini
 
     except Exception:
         logger.exception("Redeem timer failed.")
+
 
 class LimitedStack(Generic[T]):
     def __init__(self, max_size: int = MAX_TIMEOUT_STACK_SIZE) -> None:
@@ -327,6 +342,7 @@ class LimitedStack(Generic[T]):
 # -----------------------------
 # Rules
 # -----------------------------
+
 
 def load_rules(path: str = "rules.json") -> list[Rule]:
     with open(path, "r", encoding="utf-8") as f:
@@ -365,6 +381,7 @@ def find_matching_rule(text: str) -> Rule | None:
 # User data / regulars
 # -----------------------------
 
+
 def load_user_data() -> None:
     global user_data
     global regulars
@@ -396,6 +413,13 @@ def save_user_data() -> None:
 
     with open(DATA_PATH, "w", encoding="utf-8") as f:
         json.dump(user_data, f, indent=2, ensure_ascii=False)
+
+
+def save_shoutouts() -> None:
+    SHOUTOUTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(SHOUTOUTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(shoutouts, f, indent=2, ensure_ascii=False)
 
 
 def clean_login(raw_login: str) -> str:
@@ -451,6 +475,7 @@ async def add_regular_by_login(login: str, added_by_msg: ChatMessage) -> tuple[b
 
     return True, f"{user.display_name} is now a regular."
 
+
 async def add_regular_from_redeem(user_id: str, user_name: str, event_id: str) -> tuple[bool, str]:
     assert twitch is not None
 
@@ -486,9 +511,11 @@ async def add_regular_from_redeem(user_id: str, user_name: str, event_id: str) -
 
     return True, f"{user.display_name} is now a regular."
 
+
 # -----------------------------
 # Permissions / protection
 # -----------------------------
+
 
 def is_command_allowed(msg: ChatMessage, allow_vip: bool = False) -> bool:
     name = msg.user.name.lower()
@@ -528,6 +555,7 @@ def is_protected_user(msg: ChatMessage, protect_vip: bool = False) -> bool:
 # Moderation helpers
 # -----------------------------
 
+
 async def handle_link_moderation(msg: ChatMessage, normalized_text: str) -> bool:
     user_id = msg.user.id
 
@@ -562,6 +590,7 @@ async def handle_link_moderation(msg: ChatMessage, normalized_text: str) -> bool
 
     return False
 
+
 async def handle_auto_moderation(msg: ChatMessage, normalized_text: str) -> bool:
     if is_protected_user(msg):
         return False
@@ -577,6 +606,7 @@ async def handle_auto_moderation(msg: ChatMessage, normalized_text: str) -> bool
         return True
 
     return False
+
 
 async def message_to_audit_log(msg: ChatMessage, action: str = "") -> None:
     async with audit_log_lock:
@@ -619,6 +649,7 @@ async def message_to_audit_log(msg: ChatMessage, action: str = "") -> None:
         async with aiofiles.open(AUDITS_MESSAGES_PATH, mode="w", encoding="utf-8") as f:
             for entry in entries:
                 await f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
 
 async def redeem_to_audit_log(
     redeem_event: ChannelPointsCustomRewardRedemptionAddEvent,
@@ -666,9 +697,11 @@ async def redeem_to_audit_log(
             for entry in entries:
                 await f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+
 # -----------------------------
 # Twitch actions
 # -----------------------------
+
 
 async def timeout_user(msg: ChatMessage, rule: Rule) -> None:
     assert twitch is not None
@@ -697,6 +730,7 @@ async def timeout_user(msg: ChatMessage, rule: Rule) -> None:
 
     logger.info("[TIMEOUT] %s for %ss", msg.user.name, rule.duration)
 
+
 async def timeout_user_by_id(user_id: str, reason: str, duration: int) -> None:
     assert twitch is not None
     assert broadcaster_id is not None
@@ -716,6 +750,7 @@ async def timeout_user_by_id(user_id: str, reason: str, duration: int) -> None:
         duration=duration,
     )
 
+
 async def ban_user(msg: ChatMessage, reason: str) -> None:
     assert twitch is not None
     assert broadcaster_id is not None
@@ -733,6 +768,7 @@ async def ban_user(msg: ChatMessage, reason: str) -> None:
         user_id=msg.user.id,
         reason=reason,
     )
+
 
 async def ban_user_by_id(user_id: str, reason: str) -> None:
     assert twitch is not None
@@ -752,9 +788,11 @@ async def ban_user_by_id(user_id: str, reason: str) -> None:
         reason=reason,
     )
 
+
 # -----------------------------
 # Commands
 # -----------------------------
+
 
 async def handle_regular_command(msg: ChatMessage) -> bool:
     text = msg.text.strip()
@@ -794,6 +832,7 @@ async def handle_regular_command(msg: ChatMessage) -> bool:
 
     await msg.reply(response)
     return True
+
 
 async def handle_regular_remove_command(msg: ChatMessage) -> bool:
     text = msg.text.strip()
@@ -848,7 +887,8 @@ async def handle_regular_remove_command(msg: ChatMessage) -> bool:
     await msg.reply(f"{removed_info.get('display_name')} has been removed from the regulars.")
     return True
 
-async def regular_check(msg: ChatMessage) -> bool: # command for users to check if they are a regular
+
+async def regular_check(msg: ChatMessage) -> bool:  # command for users to check if they are a regular
     text = msg.text.strip()
 
     command_aliases = ("!isregular", "!checkregular", "!amiregular", "!amireg")
@@ -871,6 +911,7 @@ async def regular_check(msg: ChatMessage) -> bool: # command for users to check 
         await message_to_audit_log(msg, action="regular_check_false")
     return True
 
+
 async def lurk_announcement(msg: ChatMessage) -> bool:
     text = msg.text.strip()
 
@@ -888,6 +929,7 @@ async def lurk_announcement(msg: ChatMessage) -> bool:
     await msg.reply(f"{msg.user.display_name} is now lurking. See you later!")
     await message_to_audit_log(msg, action="lurk_announcement")
     return True
+
 
 async def coinflip_command(msg: ChatMessage) -> bool:
     text = msg.text.strip()
@@ -908,6 +950,7 @@ async def coinflip_command(msg: ChatMessage) -> bool:
     await message_to_audit_log(msg, action=f"coinflip_command_{'heads' if result == 0 else 'tails'}")
     return True
 
+
 async def handle_contextual_command(msg: ChatMessage) -> bool:
     text = msg.text.strip()
 
@@ -923,6 +966,7 @@ async def handle_contextual_command(msg: ChatMessage) -> bool:
         return True
 
     return False
+
 
 async def timeout_stack_ban(msg: ChatMessage) -> None:
     """
@@ -968,7 +1012,7 @@ async def timeout_stack_ban(msg: ChatMessage) -> None:
         if len(timeout_stack) == 0:
             break
         users_to_ban.append(timeout_stack.pop())
-    
+
     if not users_to_ban:
         await msg.reply("Timeout stack is empty.")
         return
@@ -977,12 +1021,13 @@ async def timeout_stack_ban(msg: ChatMessage) -> None:
         if DRY_RUN:
             logger.info("[DRY RUN] Would ban user ID: %s", user_id)
             continue
-        
+
         await ban_user_by_id(user_id, reason="Banned from timeout stack")
         logger.info("[BAN STACK] Banning user ID: %s", user_id)
         await message_to_audit_log(msg, action=f"ban_stack_{user_id}")
 
     await msg.reply(f"Banned the last {len(users_to_ban)} users from the timeout stack.")
+
 
 async def clear_timeout_stack(msg: ChatMessage) -> None:
     """
@@ -1010,6 +1055,7 @@ async def clear_timeout_stack(msg: ChatMessage) -> None:
     timeout_stack.clear()
     await msg.reply("Timeout stack has been cleared.")
     await message_to_audit_log(msg, action="clear_timeout_stack")
+
 
 async def check_timeout_stack(msg: ChatMessage) -> None:
     """
@@ -1041,18 +1087,72 @@ async def check_timeout_stack(msg: ChatMessage) -> None:
     user_ids = timeout_stack.to_list()
     await msg.reply(f"Timeout stack contains the following user IDs: {', '.join(user_ids)}")
     await message_to_audit_log(msg, action="check_timeout_stack")
-    
+
+
+async def handle_shoutout_command(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    command_aliases = ("!shoutout", "!so")
+
+    command_used = None
+    for alias in command_aliases:
+        if text == alias or text.startswith(alias + " "):
+            command_used = alias
+            break
+
+    if command_used is None:
+        return False
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_command")
+        return True
+
+    parts = text.split(maxsplit=1)
+
+    if len(parts) < 2:
+        await msg.reply("Usage: !shoutout username")
+        return True
+
+    target_login = clean_login(parts[1])
+    shoutout_info = shoutouts.get(target_login)
+
+    if shoutout_info and shoutout_info.get("isAlias"):
+        alias_target = shoutout_info.get("aliasFor")
+        if alias_target and alias_target in shoutouts:
+            shoutout_info = shoutouts[alias_target]
+        else:
+            shoutout_info = None
+
+    if shoutout_info:
+        shoutout_number = shoutout_info.get("shoutout_number", 0) if shoutout_info else 0
+        shoutout_number += 1
+        shoutout_info["shoutout_number"] = shoutout_number
+        response = f"Shoutout to {shoutout_info['display_name']}! {shoutout_info['message']} | This is their {ordinal(shoutout_number)} shoutout!"
+    else:
+        response = f"Shoutout to {target_login}! Check them out!"
+
+    await msg.reply(response)
+    await message_to_audit_log(msg, action="shoutout_command")
+
+    save_shoutouts()  # Save shoutouts after updating
+
+    return True
+
 
 # -----------------------------
 # Chat event handlers
 # -----------------------------
 
+
 async def on_ready(event: EventData) -> None:
     logger.info("Bot is ready; joining channel.")
     await event.chat.join_room(TARGET_CHANNEL)
 
+
 async def on_message(msg: ChatMessage) -> None:
-    await message_to_audit_log(msg) # initially log the message before any bot actions
+    await message_to_audit_log(msg)  # initially log the message before any bot actions
 
     normalized_text = advanced_normalise(msg.text)
     if await handle_auto_moderation(msg, normalized_text):
@@ -1075,8 +1175,11 @@ async def on_message(msg: ChatMessage) -> None:
         return
     if await timeout_stack_ban(msg):
         return
-        
+    if await handle_shoutout_command(msg):
+        return
+
     await handle_contextual_command(msg)
+
 
 async def on_raid(data: ChannelRaidEvent) -> None:
     assert twitch is not None
@@ -1117,16 +1220,19 @@ async def on_raid(data: ChannelRaidEvent) -> None:
             raid.from_broadcaster_user_login,
         )
 
+
 async def on_channel_point_redeem(
     data: ChannelPointsCustomRewardRedemptionAddEvent,
     chat: Chat,
 ) -> None:
     await redeem_to_audit_log(data)
-    
+
     event = data.event
 
     seconds_to_add = CHANNEL_POINT_REWARD_SECONDS.get(event.reward.id)
-    logger.info(f"Channel point redeem: {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r}, seconds to add: {seconds_to_add}")
+    logger.info(
+        f"Channel point redeem: {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r}, seconds to add: {seconds_to_add}"
+    )
 
     if seconds_to_add is not None:
         payload = {
@@ -1153,16 +1259,10 @@ async def on_channel_point_redeem(
 
             response.raise_for_status()
 
-            logger.info(
-                f"Added {seconds_to_add}s to countdown from "
-                f"{event.user_name}'s redeem: {event.reward.title}"
-            )
+            logger.info(f"Added {seconds_to_add}s to countdown from {event.user_name}'s redeem: {event.reward.title}")
 
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"Countdown app rejected redeem POST: "
-                f"{e.response.status_code} {e.response.text}"
-            )
+            logger.error(f"Countdown app rejected redeem POST: {e.response.status_code} {e.response.text}")
 
         except httpx.RequestError as e:
             logger.error(f"Could not reach countdown app: {e}")
@@ -1173,7 +1273,7 @@ async def on_channel_point_redeem(
         )
         await add_regular_from_redeem(event.user_id, event.user_name, event.id)
         await redeem_to_audit_log(data, action="become_regular_redeem")
-        
+
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
@@ -1189,13 +1289,20 @@ async def on_channel_point_redeem(
             f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Glasses Off' redeem."
         )
         await redeem_to_audit_log(data, action="glasses_off_redeem")
-        
+
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
                 f"{event.user_name} has redeemed 'Glasses Off'! Starting 5 minute 30 second timer",
             )
-            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="glasses_off", finished_text=f"{event.user_name}'s 'Glasses Off' timer is done!"))
+            asyncio.create_task(
+                redeem_timer(
+                    chat,
+                    TARGET_CHANNEL,
+                    duration="glasses_off",
+                    finished_text=f"{event.user_name}'s 'Glasses Off' timer is done!",
+                )
+            )
         else:
             logger.warning(
                 "Could not announce 'Glasses Off' redeem for %s because chat is not ready.",
@@ -1206,13 +1313,20 @@ async def on_channel_point_redeem(
             f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Sensitivity' redeem."
         )
         await redeem_to_audit_log(data, action="sensitivity_redeem")
-        
+
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
                 f"{event.user_name} has redeemed 'Sensitivity'! Starting 5 minute 30 second timer",
             )
-            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="sensitivity", finished_text=f"{event.user_name}'s 'Sensitivity' timer is done!"))
+            asyncio.create_task(
+                redeem_timer(
+                    chat,
+                    TARGET_CHANNEL,
+                    duration="sensitivity",
+                    finished_text=f"{event.user_name}'s 'Sensitivity' timer is done!",
+                )
+            )
         else:
             logger.warning(
                 "Could not announce 'Sensitivity' redeem for %s because chat is not ready.",
@@ -1223,13 +1337,20 @@ async def on_channel_point_redeem(
             f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is an 'In-Game Action' redeem."
         )
         await redeem_to_audit_log(data, action="in_game_action_redeem")
-        
+
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
                 f"{event.user_name} has redeemed 'In-Game Action'! You cannot \"{event.user_input}\" for 5 minutes. Timer set!",
             )
-            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="in_game_action", finished_text=f"{event.user_name}'s 'In-Game Action' ({event.user_input}) timer is done!"))
+            asyncio.create_task(
+                redeem_timer(
+                    chat,
+                    TARGET_CHANNEL,
+                    duration="in_game_action",
+                    finished_text=f"{event.user_name}'s 'In-Game Action' ({event.user_input}) timer is done!",
+                )
+            )
         else:
             logger.warning(
                 "Could not announce 'In-Game Action' redeem for %s because chat is not ready.",
@@ -1240,13 +1361,20 @@ async def on_channel_point_redeem(
             f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Ban Word' redeem."
         )
         await redeem_to_audit_log(data, action="ban_word_redeem")
-        
+
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
                 f"{event.user_name} has redeemed 'Ban Word'! The word '{event.user_input}' is now banned for 5 minutes. Timer set!",
             )
-            asyncio.create_task(redeem_timer(chat, TARGET_CHANNEL, duration="ban_word", finished_text=f"{event.user_name}'s 'Ban Word' ({event.user_input}) timer is done!"))
+            asyncio.create_task(
+                redeem_timer(
+                    chat,
+                    TARGET_CHANNEL,
+                    duration="ban_word",
+                    finished_text=f"{event.user_name}'s 'Ban Word' ({event.user_input}) timer is done!",
+                )
+            )
         else:
             logger.warning(
                 "Could not announce 'Ban Word' redeem for %s because chat is not ready.",
@@ -1257,7 +1385,7 @@ async def on_channel_point_redeem(
             f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'TTS' redeem."
         )
         await redeem_to_audit_log(data, action="tts_redeem")
-        
+
         if chat.is_ready():
             await chat.send_message(
                 TARGET_CHANNEL,
@@ -1266,10 +1394,7 @@ async def on_channel_point_redeem(
             success, message = await send_tts_message(event.user_input)
             if not success:
                 logger.warning("TTS message failed: %s", message)
-                await chat.send_message(
-                    TARGET_CHANNEL,
-                    f"TTS message failed: {message}"
-                )
+                await chat.send_message(TARGET_CHANNEL, f"TTS message failed: {message}")
         else:
             logger.warning(
                 "Could not announce 'TTS' redeem for %s because chat is not ready.",
@@ -1282,11 +1407,10 @@ async def on_channel_point_redeem(
         await redeem_to_audit_log(data, action="check_in_redeem")
 
         day_num = await handle_check_in_redeem(event.user_id, event.user_name)
-        
+
         if chat.is_ready():
             await chat.send_message(
-                TARGET_CHANNEL,
-                f"{event.user_name} has redeemed 'Check-In'! Thanks for checking in! Day {day_num}."
+                TARGET_CHANNEL, f"{event.user_name} has redeemed 'Check-In'! Thanks for checking in! Day {day_num}."
             )
         else:
             logger.warning(
@@ -1306,10 +1430,7 @@ async def on_shared_chat_begin(event: ChannelSharedChatBeginEvent, chat: Chat) -
     data = event.event
     shared_chat_session_id = data.session_id
 
-    participants = ", ".join(
-        p.broadcaster_user_login
-        for p in data.participants
-    )
+    participants = ", ".join(p.broadcaster_user_login for p in data.participants)
 
     logger.info(
         "Shared chat started: session=%s host=%s participants=%s",
@@ -1324,10 +1445,7 @@ async def on_shared_chat_begin(event: ChannelSharedChatBeginEvent, chat: Chat) -
 async def on_shared_chat_update(event: ChannelSharedChatUpdateEvent, chat: Chat) -> None:
     data = event.event
 
-    participants = ", ".join(
-        p.broadcaster_user_login
-        for p in data.participants
-    )
+    participants = ", ".join(p.broadcaster_user_login for p in data.participants)
 
     logger.info(
         "Shared chat updated: session=%s host=%s participants=%s",
@@ -1352,8 +1470,9 @@ async def on_shared_chat_end(event: ChannelSharedChatEndEvent, chat: Chat) -> No
 
     if shared_chat_session_id == data.session_id:
         shared_chat_session_id = None
-    
+
     await announce(chat, f"Shared chat ended! Host: {data.host_broadcaster_user_login}.")
+
 
 async def announce(chat: Chat, message: str) -> None:
     if chat.is_ready():
@@ -1361,9 +1480,11 @@ async def announce(chat: Chat, message: str) -> None:
     else:
         logger.warning("Could not announce because chat is not ready: %s", message)
 
+
 # -----------------------------
 # Main
 # -----------------------------
+
 
 async def main() -> None:
     global twitch
@@ -1399,7 +1520,6 @@ async def main() -> None:
         data: ChannelPointsCustomRewardRedemptionAddEvent,
     ) -> None:
         await on_channel_point_redeem(data, chat)
-
 
     eventsub = EventSubWebsocket(twitch)
     eventsub.start()

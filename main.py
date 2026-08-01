@@ -77,6 +77,7 @@ DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
 DATA_PATH = Path("user_data") / f"{TARGET_CHANNEL}.json"
 SHOUTOUTS_PATH = Path("user_data") / "shoutouts.json"
+COUNTERS_PATH = Path("counters") / f"{TARGET_CHANNEL}_counters.json"
 
 DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
 
@@ -142,6 +143,16 @@ if not SHOUTOUTS_PATH.exists():
 else:
     with open(SHOUTOUTS_PATH, "r", encoding="utf-8") as f:
         shoutouts = json.load(f)
+
+if not COUNTERS_PATH.exists():
+    logger.warning(
+        "Counters file does not exist: %s.",
+        COUNTERS_PATH,
+    )
+    counters = {}
+else:
+    with open(COUNTERS_PATH, "r", encoding="utf-8") as f:
+        counters = json.load(f)
 
 CHANNEL_POINT_REWARD_SECONDS = {
     reward_data.get("add_minute", "1_min_id"): 60,
@@ -501,6 +512,13 @@ def save_shoutouts() -> None:
 
     with open(SHOUTOUTS_PATH, "w", encoding="utf-8") as f:
         json.dump(shoutouts, f, indent=2, ensure_ascii=False)
+
+
+def save_counters() -> None:
+    COUNTERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(COUNTERS_PATH, "w", encoding="utf-8") as f:
+        json.dump(counters, f, indent=2, ensure_ascii=False)
 
 
 def clean_login(raw_login: str) -> str:
@@ -1258,6 +1276,35 @@ async def handle_shoutout_command(msg: ChatMessage) -> bool:
     return True
 
 
+async def handle_counters(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    commands = [
+        {"name": "bug", "aliases": ["glitch", "issue"]},
+        {"name": "mispronounce", "aliases": ["mispronunciation", "mispeak"]},
+    ]
+
+    for command in commands:
+        command_aliases = [f"!{command['name']}"] + [f"!{alias}" for alias in command["aliases"]]
+
+        command_used = None
+        for alias in command_aliases:
+            if text == alias or text.startswith(alias + " "):
+                command_used = alias
+                break
+
+        if command_used is not None:
+            counter_name = command["name"]
+            current_count = counters.get(counter_name, 0)
+            counters[counter_name] = current_count + 1
+
+            await msg.reply(f"{counter_name.capitalize()} count is now {counters[counter_name]}.")
+            await message_to_audit_log(msg, action=f"counter_{counter_name}_incremented")
+
+            return True
+    return False
+
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------
@@ -1293,6 +1340,8 @@ async def on_message(msg: ChatMessage) -> None:
     if await timeout_stack_ban(msg):
         return
     if await handle_shoutout_command(msg):
+        return
+    if await handle_counters(msg):
         return
 
     await handle_contextual_command(msg)

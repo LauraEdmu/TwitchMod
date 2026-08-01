@@ -1,3 +1,4 @@
+.archive/
 .env
 diagnostic/
 *.json
@@ -7,3 +8,4 @@ main_logs/*.log
 main_logs/*.zstd
 user_data/
 benchmark/
+tests/

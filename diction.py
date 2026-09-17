@@ -71,7 +71,7 @@ if __name__ == "__main__":
         # else:
         #     print(f"No definition found for {word!r}.")
 
-        synonyms_antonyms = thesaurus(word, "sZaGWiD5pUtrxxb4B13aaX09imxkpnanJb40cbtw")
+        synonyms_antonyms = thesaurus(word, "REDACTED")
         if synonyms_antonyms:
             synonyms, antonyms = synonyms_antonyms
             print(

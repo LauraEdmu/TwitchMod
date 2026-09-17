@@ -27,7 +27,7 @@ from twitchAPI.object.eventsub import (
 from twitchAPI.twitch import Twitch
 from twitchAPI.type import AuthScope, ChatEvent
 
-from diction import define, thesaurus
+import diction
 from parse_helpers.homoglyphs import advanced_normalise
 from parse_helpers.thisis import contains_non_twitch_link, is_link
 
@@ -98,6 +98,9 @@ REDEEM_TIMERS_SECONDS = {
     "ban_word": 330,
     "ad_break": 180,
 }
+
+dictionary = diction.Dictionary()
+dictionary.read_cache()
 
 # twitchAPI chat helper uses IRC chat scopes.
 # The timeout API needs MODERATOR_MANAGE_BANNED_USERS.
@@ -1478,7 +1481,7 @@ async def handle_define_command(msg: ChatMessage) -> bool:
         return True
 
     word = parts[1]
-    definition = define(word)
+    definition = await asyncio.to_thread(dictionary.define, word)
 
     if definition:
         await msg.reply(f"Definition of {word!r}: {definition}")
@@ -1502,15 +1505,13 @@ async def handle_thesaurus_command(msg: ChatMessage) -> bool:
     if command_used is None:
         return False
 
-    print("Handling thesaurus command")
-
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
         await msg.reply("Please provide a word to look up in the thesaurus.")
         return True
 
     word = parts[1]
-    result = thesaurus(word, THESAURUS_API_KEY)
+    result = await asyncio.to_thread(dictionary.thesaurus, word, THESAURUS_API_KEY)
 
     if result:
         synonyms, antonyms = result
@@ -1524,6 +1525,9 @@ async def handle_thesaurus_command(msg: ChatMessage) -> bool:
         )
     else:
         await msg.reply(f"No thesaurus entry found for {word!r}.")
+        # debug print
+        print(f"No thesaurus entry found for {word!r}.")
+        print(f"Result was: {result}")
 
     await message_to_audit_log(msg, action="thesaurus_command")
     return True

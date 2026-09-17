@@ -27,6 +27,7 @@ from twitchAPI.object.eventsub import (
 from twitchAPI.twitch import Twitch
 from twitchAPI.type import AuthScope, ChatEvent
 
+from diction import define, thesaurus
 from parse_helpers.homoglyphs import advanced_normalise
 from parse_helpers.thisis import contains_non_twitch_link, is_link
 
@@ -85,6 +86,8 @@ MAX_TIMEOUT_STACK_SIZE = int(os.getenv("MAX_TIMEOUT_STACK_SIZE", "5"))
 
 UK_TZ = ZoneInfo("Europe/London")
 
+THESAURUS_API_KEY = os.environ["THESAURUS_API_KEY"]
+
 REDEEM_TIMERS_SECONDS = {
     "short": 60,
     "medium": 330,
@@ -93,6 +96,7 @@ REDEEM_TIMERS_SECONDS = {
     "sensitivity": 330,
     "in_game_action": 330,
     "ban_word": 330,
+    "ad_break": 180,
 }
 
 # twitchAPI chat helper uses IRC chat scopes.
@@ -173,6 +177,13 @@ class Rule:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class ReadoutMessage:
+    text: str
+    user_name: str
+    user_display_name: str
+
+
 # -----------------------------
 # Global runtime state
 # -----------------------------
@@ -181,6 +192,7 @@ twitch: Twitch | None = None
 broadcaster_id: str | None = None
 moderator_id: str | None = None
 shared_chat_session_id: str | None = None
+last_readout_message: ReadoutMessage | None = None
 
 user_data: dict[str, Any] = {}
 regulars: dict[str, dict[str, Any]] = {}
@@ -329,7 +341,7 @@ async def handle_check_in_redeem(user_id: str, user_name: str = "") -> int:
     return new_days
 
 
-async def send_tts_message(user_input: str) -> tuple[bool, str]:
+async def send_tts_message(user_input: str, skip_checks=False) -> tuple[bool, str]:
     """
     Send a TTS message to env: $TTS_ADDRESS with $TTS_SECRET in the header.
     """
@@ -345,19 +357,23 @@ async def send_tts_message(user_input: str) -> tuple[bool, str]:
 
     normalised_input = advanced_normalise(user_input)
     rule_match = find_matching_rule(normalised_input)
-    if rule_match:
-        logger.info(
-            "TTS message matches rule %r; skipping TTS message.",
-            rule_match.name,
-        )
-        return False, f"TTS message matches rule {rule_match.name}; skipping TTS message."
-    elif char_count > 200 or word_count > 40:
-        logger.info(
-            "TTS message is too long (%d characters, %d words); skipping TTS message.",
-            char_count,
-            word_count,
-        )
-        return False, f"TTS message is too long ({char_count} characters, {word_count} words); skipping TTS message."
+    if not skip_checks:
+        if rule_match:
+            logger.info(
+                "TTS message matches rule %r; skipping TTS message.",
+                rule_match.name,
+            )
+            return False, f"TTS message matches rule {rule_match.name}; skipping TTS message."
+        elif char_count > 200 or word_count > 40:
+            logger.info(
+                "TTS message is too long (%d characters, %d words); skipping TTS message.",
+                char_count,
+                word_count,
+            )
+            return (
+                False,
+                f"TTS message is too long ({char_count} characters, {word_count} words); skipping TTS message.",
+            )
 
     payload = {
         "text": user_input,
@@ -405,6 +421,25 @@ async def redeem_timer(chat, target_channel: str, duration: str = "medium", fini
 
     except Exception:
         logger.exception("Redeem timer failed.")
+
+
+async def ad_timer(chat, target_channel: str, duration: str = "ad_break", finished_text: str = "") -> None:
+    try:
+        logger.info(f"Starting ad timer for {duration} seconds in channel {target_channel}.")
+        await asyncio.sleep(REDEEM_TIMERS_SECONDS[duration])
+
+        await chat.send_message(
+            target_channel, finished_text or f"Ad break done! {REDEEM_TIMERS_SECONDS[duration]} seconds have elapsed."
+        )
+        logger.info(f"Ad timer for {duration} seconds in channel {target_channel} finished.")
+
+    except asyncio.CancelledError:
+        # Only needed if you later add cancellation/reset logic
+        logger.info("Ad timer was cancelled.")
+        raise
+
+    except Exception:
+        logger.exception("Ad timer failed.")
 
 
 class LimitedStack(Generic[T]):
@@ -1263,10 +1298,17 @@ async def handle_shoutout_command(msg: ChatMessage) -> bool:
             f"https://www.twitch.tv/{channel_login} | "
             f"This is their {ordinal(shoutout_number)} shoutout!"
         )
+        # send tts version
+        await send_tts_message(
+            f"Shoutout to {display_name}! {custom_message}{category_text} This is their {ordinal(shoutout_number)} shoutout!",
+            skip_checks=True,
+        )
     else:
         response = (
             f"Shoutout to {api_display_name}! Check them out!{category_text} | https://www.twitch.tv/{channel_login}"
         )
+        # send tts version
+        await send_tts_message(f"Shoutout to {api_display_name}! Check them out!{category_text}", skip_checks=True)
 
     await msg.reply(response)
     await message_to_audit_log(msg, action="shoutout_command")
@@ -1277,32 +1319,214 @@ async def handle_shoutout_command(msg: ChatMessage) -> bool:
 
 
 async def handle_counters(msg: ChatMessage) -> bool:
-    text = msg.text.strip()
+    text = msg.text.strip().casefold()
 
     commands = [
         {"name": "bug", "aliases": ["glitch", "issue"]},
-        {"name": "mispronounce", "aliases": ["mispronunciation", "mispeak"]},
+        {
+            "name": "mispronounce",
+            "aliases": ["mispronunciation", "mispeak"],
+        },
     ]
 
+    decrement_words = {"decrement", "remove", "subtract"}
+
     for command in commands:
-        command_aliases = [f"!{command['name']}"] + [f"!{alias}" for alias in command["aliases"]]
+        command_aliases = [
+            f"!{command['name']}",
+            *(f"!{alias}" for alias in command["aliases"]),
+        ]
 
-        command_used = None
-        for alias in command_aliases:
-            if text == alias or text.startswith(alias + " "):
-                command_used = alias
-                break
+        command_used = next(
+            (alias for alias in command_aliases if text == alias or text.startswith(alias + " ")),
+            None,
+        )
 
-        if command_used is not None:
-            counter_name = command["name"]
-            current_count = counters.get(counter_name, 0)
+        if command_used is None:
+            continue
+
+        counter_name = command["name"]
+        current_count = counters.get(counter_name, 0)
+
+        arguments = text[len(command_used) :].strip().split()
+        should_decrement = any(argument in decrement_words for argument in arguments)
+
+        if should_decrement:
+            if current_count == 0:
+                await msg.reply(f"{counter_name.capitalize()} count is already at 0; cannot decrement.")
+                return True
+
+            counters[counter_name] = current_count - 1
+            action = f"counter_{counter_name}_decremented"
+        else:
             counters[counter_name] = current_count + 1
+            action = f"counter_{counter_name}_incremented"
 
-            await msg.reply(f"{counter_name.capitalize()} count is now {counters[counter_name]}.")
-            await message_to_audit_log(msg, action=f"counter_{counter_name}_incremented")
+        await message_to_audit_log(msg, action=action)
+        save_counters()
 
-            return True
+        await msg.reply(f"{counter_name.capitalize()} count is now {counters[counter_name]}.")
+
+        return True
+
     return False
+
+
+async def handle_readout_command(msg: ChatMessage) -> bool:
+    """Send the most recent eligible chat message to TTS."""
+    text = msg.text.strip().casefold()
+
+    command_aliases = ("!readout", "!readthat")
+
+    command_used = next(
+        (alias for alias in command_aliases if text == alias or text.startswith(alias + " ")),
+        None,
+    )
+
+    if command_used is None:
+        return False
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_readout_command")
+        return True
+
+    if last_readout_message is None:
+        await msg.reply("There is no previous chat message to read.")
+        await message_to_audit_log(msg, action="readout_no_message")
+        return True
+
+    success, response = await send_tts_message(
+        f"{last_readout_message.user_display_name} said: {last_readout_message.text}", skip_checks=True
+    )
+
+    if success:
+        logger.info(
+            "[READOUT] %s requested message from %s: %r",
+            msg.user.name,
+            last_readout_message.user_name,
+            last_readout_message.text,
+        )
+        await message_to_audit_log(msg, action="readout_command_success")
+    else:
+        logger.warning(
+            "[READOUT FAILED] %s requested message from %s: %s",
+            msg.user.name,
+            last_readout_message.user_name,
+            response,
+        )
+        await msg.reply(f"Readout failed: {response}")
+        await message_to_audit_log(msg, action="readout_command_failed")
+
+    return True
+
+
+async def handle_ad_announcement(msg: ChatMessage) -> bool:
+    """Handle ad announcements in chat."""
+    text = msg.text.strip().casefold()
+
+    command_aliases = ("!adbreak", "!advertisement")
+
+    command_used = next(
+        (alias for alias in command_aliases if text == alias or text.startswith(alias + " ")),
+        None,
+    )
+
+    if command_used is None:
+        return False
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_ad_announcement")
+        return True
+
+    await msg.reply(
+        "A 3 minute ad-break has started. By doing a 3 minute ad-break twitch should suppress ads for everyone otherwise for an hour!"
+    )
+    await message_to_audit_log(msg, action="ad_announcement")
+
+    asyncio.create_task(
+        ad_timer(
+            msg.chat,
+            TARGET_CHANNEL,
+            duration="ad_break",
+            finished_text="The 3 minute ad-break has ended!",
+        )
+    )
+
+    return True
+
+
+async def handle_define_command(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    command_aliases = ("!define",)
+
+    command_used = next(
+        (alias for alias in command_aliases if text == alias or text.startswith(alias + " ")),
+        None,
+    )
+
+    if command_used is None:
+        return False
+
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply("Please provide a word to define.")
+        return True
+
+    word = parts[1]
+    definition = define(word)
+
+    if definition:
+        await msg.reply(f"Definition of {word!r}: {definition}")
+    else:
+        await msg.reply(f"No definition found for {word!r}.")
+
+    await message_to_audit_log(msg, action="define_command")
+    return True
+
+
+async def handle_thesaurus_command(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    command_aliases = ("!thesaurus", "!thesaur")
+
+    command_used = next(
+        (alias for alias in command_aliases if text == alias or text.startswith(alias + " ")),
+        None,
+    )
+
+    if command_used is None:
+        return False
+
+    print("Handling thesaurus command")
+
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply("Please provide a word to look up in the thesaurus.")
+        return True
+
+    word = parts[1]
+    result = thesaurus(word, THESAURUS_API_KEY)
+
+    if result:
+        synonyms, antonyms = result
+
+        synonyms = synonyms[:10]
+        antonyms = antonyms[:10]
+
+        await msg.reply(
+            f"Synonyms of {word!r}: {', '.join(synonyms) if synonyms else 'None'} | "
+            f"Antonyms: {', '.join(antonyms) if antonyms else 'None'}"
+        )
+    else:
+        await msg.reply(f"No thesaurus entry found for {word!r}.")
+
+    await message_to_audit_log(msg, action="thesaurus_command")
+    return True
 
 
 # -----------------------------
@@ -1316,7 +1540,9 @@ async def on_ready(event: EventData) -> None:
 
 
 async def on_message(msg: ChatMessage) -> None:
-    await message_to_audit_log(msg)  # initially log the message before any bot actions
+    global last_readout_message
+
+    await message_to_audit_log(msg)
 
     normalized_text = advanced_normalise(msg.text)
     if await handle_auto_moderation(msg, normalized_text):
@@ -1343,8 +1569,26 @@ async def on_message(msg: ChatMessage) -> None:
         return
     if await handle_counters(msg):
         return
+    if await handle_ad_announcement(msg):
+        return
+    if await handle_readout_command(msg):
+        return
+    if await handle_define_command(msg):
+        return
+    if await handle_thesaurus_command(msg):
+        return
 
     await handle_contextual_command(msg)
+
+    # Do not store messages sent by the bot itself.
+    if BOT_LOGIN and msg.user.name.casefold() == BOT_LOGIN:
+        return
+
+    last_readout_message = ReadoutMessage(
+        text=msg.text.strip(),
+        user_name=msg.user.name,
+        user_display_name=msg.user.display_name,
+    )
 
 
 async def on_raid(data: ChannelRaidEvent) -> None:
@@ -1520,6 +1764,30 @@ async def on_channel_point_redeem(
         else:
             logger.warning(
                 "Could not announce 'In-Game Action' redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    elif event.reward.id == reward_data.get("in_rl_action", "in_rl_action_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is an 'In-Real-Life Action' redeem."
+        )
+        await redeem_to_audit_log(data, action="in_rl_action_redeem")
+
+        if chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"{event.user_name} has redeemed 'In-Real-Life Action'! You cannot \"{event.user_input}\" for 5 minutes. Timer set!",
+            )
+            asyncio.create_task(
+                redeem_timer(
+                    chat,
+                    TARGET_CHANNEL,
+                    duration="in_game_action",
+                    finished_text=f"{event.user_name}'s 'In-Real-Life Action' ({event.user_input}) timer is done!",
+                )
+            )
+        else:
+            logger.warning(
+                "Could not announce 'In-Real-Life Action' redeem for %s because chat is not ready.",
                 event.user_name,
             )
     elif event.reward.id == reward_data.get("ban_word", "ban_word_id"):

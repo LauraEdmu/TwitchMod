@@ -1533,6 +1533,25 @@ async def handle_thesaurus_command(msg: ChatMessage) -> bool:
     return True
 
 
+async def handle_spike_command(msg: ChatMessage) -> bool:  # gag command
+    text = msg.text.strip()
+
+    command_aliases = ("!spike",)
+
+    command_used = next(
+        (alias for alias in command_aliases if text == alias or text.startswith(alias + " ")),
+        None,
+    )
+
+    if command_used is None:
+        return False
+
+    await msg.reply("Definition of 'spike': A sort of very large nail.")
+
+    await message_to_audit_log(msg, action="spike_command")
+    return True
+
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------

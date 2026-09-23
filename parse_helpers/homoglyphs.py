@@ -1,8 +1,8 @@
+import re
 import string
 import unicodedata
 from functools import cache
 from typing import Callable
-import re
 
 from confusable_homoglyphs import confusables
 
@@ -16,62 +16,68 @@ ZERO_WIDTH_CHARS = (
 
 ZERO_WIDTH = set(ZERO_WIDTH_CHARS)
 
+ZERO_WIDTH_RE = re.compile("[" + "".join(re.escape(ch) for ch in ZERO_WIDTH_CHARS) + "]+")
+
 
 def remove_zero_width(text: str) -> str:
     if not any(ch in text for ch in ZERO_WIDTH_CHARS):
         return text
 
-    return "".join(ch for ch in text if ch not in ZERO_WIDTH)
+    return ZERO_WIDTH_RE.sub("", text)
+
 
 ASCII_TARGETS = set(string.ascii_lowercase + string.digits)
 
 # Extra folds for common "small caps" / modifier-letter spam that NFKC often
 # does not reduce to plain ASCII.
-EXTRA_HOMOGLYPH_MAP = str.maketrans({
-    "ʙ": "b",
-    "ᴄ": "c",
-    "ᴅ": "d",
-    "ᴇ": "e",
-    "ғ": "f",
-    "ɢ": "g",
-    "ʜ": "h",
-    "ɪ": "i",
-    "ᴊ": "j",
-    "ᴋ": "k",
-    "ʟ": "l",
-    "ᴍ": "m",
-    "ɴ": "n",
-    "ᴏ": "o",
-    "ᴘ": "p",
-    "ʀ": "r",
-    "ᴛ": "t",
-    "ᴜ": "u",
-    "ᴠ": "v",
-    "ᴡ": "w",
-    "ʏ": "y",
-    "ᴢ": "z",
-    "🅦": "w",
-    "🅞": "o",
-    "🅡": "r",
-    "🅛": "l",
-    "🅓": "d",
-    "ᕼ": "h",
-    "ᗴ": "e",
-    "ᒪ": "l",
-    "ᗯ": "w",
-    "ᖇ": "r",
-    "ᗪ": "d",
-    "Ь": "b",
-    "ь": "b",
-    "Η": "h",
-    "η": "h",
-    "Ε": "e",
-    "ε": "e",
-    "Ο": "o",
-    "ο": "o",
-})
+EXTRA_HOMOGLYPH_MAP = str.maketrans(
+    {
+        "ʙ": "b",
+        "ᴄ": "c",
+        "ᴅ": "d",
+        "ᴇ": "e",
+        "ғ": "f",
+        "ɢ": "g",
+        "ʜ": "h",
+        "ɪ": "i",
+        "ᴊ": "j",
+        "ᴋ": "k",
+        "ʟ": "l",
+        "ᴍ": "m",
+        "ɴ": "n",
+        "ᴏ": "o",
+        "ᴘ": "p",
+        "ʀ": "r",
+        "ᴛ": "t",
+        "ᴜ": "u",
+        "ᴠ": "v",
+        "ᴡ": "w",
+        "ʏ": "y",
+        "ᴢ": "z",
+        "🅦": "w",
+        "🅞": "o",
+        "🅡": "r",
+        "🅛": "l",
+        "🅓": "d",
+        "ᕼ": "h",
+        "ᗴ": "e",
+        "ᒪ": "l",
+        "ᗯ": "w",
+        "ᖇ": "r",
+        "ᗪ": "d",
+        "Ь": "b",
+        "ь": "b",
+        "Η": "h",
+        "η": "h",
+        "Ε": "e",
+        "ε": "e",
+        "Ο": "o",
+        "ο": "o",
+    }
+)
 
 PARENTHESISED_LETTER_RE = re.compile(r"\(([a-z])\)")
+
 
 def basic_normalise(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
@@ -93,10 +99,7 @@ def strip_combining_marks(text: str) -> str:
     This is useful for moderation matching, but destructive for real text.
     """
     text = unicodedata.normalize("NFKD", text)
-    text = "".join(
-        ch for ch in text
-        if not unicodedata.category(ch).startswith("M")
-    )
+    text = "".join(ch for ch in text if not unicodedata.category(ch).startswith("M"))
     return unicodedata.normalize("NFKC", text)
 
 
@@ -125,6 +128,7 @@ def _confusable_char_to_ascii(ch: str) -> str:
             return replacement
 
     return ch
+
 
 def fold_confusables_to_ascii(text: str) -> str:
     return "".join(_confusable_char_to_ascii(ch) for ch in text)
@@ -170,12 +174,13 @@ def run_cases(cases: dict[str, str], normaliser: Callable[[str], str]) -> None:
             print("-" * 40)
         else:
             successes += 1
-    
+
     percentage = (successes / num_of_cases * 100) if num_of_cases > 0 else 0
     print(f"\nResults: {successes} passed, {failures} failed ({percentage:.1f}% success rate)")
 
+
 if __name__ == "__main__":
-    test_cases = ({
+    test_cases = {
         # Mathematical / styled Latin
         "𝓱𝓮𝓵𝓵𝓸": "hello",
         "𝔥𝔢𝔩𝔩𝔬": "hello",
@@ -189,13 +194,11 @@ if __name__ == "__main__":
         "𝔚𝔬𝔯𝔩𝔡!": "world!",
         "𝕎𝕠𝕣𝕝𝕕!": "world!",
         "𝙒𝙤𝙧𝙡𝙙!": "world!",
-
         # Full-width ASCII
         "Ｈｅｌｌｏ": "hello",
         "Ｗｏｒｌｄ！": "world!",
         "ｓｔｒｅａｍｂｏｏ．ｃｏｍ": "streamboo.com",
         "Ａｉ　ｖｉｅｗｅｒｓ": "ai viewers",
-
         # Circled / enclosed / parenthesised letters
         "ⓗⓔⓛⓛⓞ": "hello",
         "ⓦⓞⓡⓛⓓ": "world",
@@ -203,45 +206,40 @@ if __name__ == "__main__":
         "⒜Ⓘ ⓥⓘⓔⓦⓔⓡⓢ": "ai viewers",
         "🄷🄴🄻🄻🄾": "hello",
         "🅦🅞🅡🅛🅓": "world",
-
         # Modifier / small-cap-ish letters
         "ʰᵉˡˡᵒ": "hello",
         "ʷᵒʳˡᵈ": "world",
         "ᕼᗴᒪᒪO": "hello",
         "ᗯOᖇᒪᗪ": "world",
-
         # Common Cyrillic homoglyphs
-        "hеllo": "hello",          # Cyrillic е
-        "hellо": "hello",          # Cyrillic о
-        "һеllо": "hello",          # Cyrillic һ + о
-        "wоrld": "world",          # Cyrillic о
+        "hеllo": "hello",  # Cyrillic е
+        "hellо": "hello",  # Cyrillic о
+        "һеllо": "hello",  # Cyrillic һ + о
+        "wоrld": "world",  # Cyrillic о
         "ѕtreamboo": "streamboo",  # Cyrillic ѕ
         "strеamЬоо": "streamboo",  # Cyrillic е, Ь, оо
         "ѕtrеаmbоо": "streamboo",  # Cyrillic ѕ, е, а, оо
         "streambоо.соm": "streamboo.com",
         "ѕtrеаmbоо.соm": "streamboo.com",
-
         # Common Greek homoglyphs
-        "Ηello": "hello",          # Greek capital eta
-        "heⅼⅼo": "hello",          # Roman numeral small fifty chars
-        "wοrld": "world",          # Greek omicron
+        "Ηello": "hello",  # Greek capital eta
+        "heⅼⅼo": "hello",  # Roman numeral small fifty chars
+        "wοrld": "world",  # Greek omicron
         "strεambοο": "streamboo",  # Greek epsilon + omicrons
-        "ΑΙ viewers": "ai viewers", # Greek Alpha + Iota
+        "ΑΙ viewers": "ai viewers",  # Greek Alpha + Iota
         "Αi viеwеrs": "ai viewers",
-
         # Mixed scripts and punctuation/casing
         "Ａі ѵіеԝеrѕ ѕtrеаmbоо.соm": "ai viewers streamboo.com",
         "Ai Ⅴiеwеrѕ StreamЬоо.Com": "ai viewers streamboo.com",
         "𝘼𝙞 𝙫𝙞𝙚𝙬𝙚𝙧𝙨 ѕtrеаmbоо.соm": "ai viewers streamboo.com",
         "ʜᴇʟʟᴏ, ᴡᴏʀʟᴅ!": "hello, world!",
         "𝖍𝖊𝖑𝖑𝖔, 𝐰𝐨𝐫𝐥𝐝!": "hello, world!",
-
         # Zero-width / invisible characters
         "he\u200bllo": "hello",
         "wor\u200cld": "world",
         "stream\u200bboo.com": "streamboo.com",
         "ai\u2060 viewers": "ai viewers",
-    })
+    }
 
     # test_cases.update({
     #     # Numbers that commonly appear in leetspeak-style normalisation

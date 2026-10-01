@@ -1552,6 +1552,86 @@ async def handle_spike_command(msg: ChatMessage) -> bool:  # gag command
     return True
 
 
+async def handle_lemon_command(msg: ChatMessage) -> bool:  # gag command
+    text = msg.text.strip()
+
+    command_aliases = ("!lemon",)
+
+    command_used = next(
+        (alias for alias in command_aliases if text == alias or text.startswith(alias + " ")),
+        None,
+    )
+
+    if command_used is None:
+        return False
+
+    await msg.reply("Definition of 'lemon': A sour yellow fruit.")
+
+    await message_to_audit_log(msg, action="lemon_command")
+    return True
+
+
+def get_user_tier(msg: ChatMessage) -> str:
+    user = msg.user
+
+    if user.name.casefold() == TARGET_CHANNEL.casefold() or user.mod:
+        return "mod"
+
+    if user.vip:
+        return "vip"
+
+    if user.subscriber:
+        return "sub"
+
+    return "normal"
+
+
+CHAT_LIST_URL = os.getenv(
+    "CHAT_LIST_URL",
+    "http://90.203.14.179:8787/message",
+)
+
+
+async def send_to_chat_list(
+    user: str, message: str, msg: ChatMessage, with_tier: bool = False, test_mode: bool = False
+) -> None:
+    if with_tier:  # get the user's tier, as in normal, sub, vip, or mod
+        tier = get_user_tier(msg)  # Replace this with actual logic to determine the user's tier
+
+    colour = msg.user.color or ""
+
+    if test_mode:
+        if message.split()[0] in ("mod", "vip", "sub", "normal"):
+            tier = message.split()[0]
+
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.post(
+                CHAT_LIST_URL,
+                json={
+                    "user": user,
+                    "message": message,
+                    "tier": tier if with_tier else "normal",
+                    "colour": colour,
+                },
+            )
+
+        response.raise_for_status()
+
+    except httpx.HTTPStatusError as e:
+        logger.warning(
+            "Chat list rejected message: %s %s",
+            e.response.status_code,
+            e.response.text,
+        )
+
+    except httpx.RequestError as e:
+        logger.warning(
+            "Could not reach chat list: %s",
+            e,
+        )
+
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------
@@ -1566,6 +1646,7 @@ async def on_message(msg: ChatMessage) -> None:
     global last_readout_message
 
     await message_to_audit_log(msg)
+    await send_to_chat_list(msg.user.name, msg.text, msg=msg, with_tier=True, test_mode=True)
 
     normalized_text = advanced_normalise(msg.text)
     if await handle_auto_moderation(msg, normalized_text):
@@ -1599,6 +1680,10 @@ async def on_message(msg: ChatMessage) -> None:
     if await handle_define_command(msg):
         return
     if await handle_thesaurus_command(msg):
+        return
+    if await handle_spike_command(msg):
+        return
+    if await handle_lemon_command(msg):
         return
 
     await handle_contextual_command(msg)

@@ -4,7 +4,7 @@ import logging
 import os
 import random
 import re
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1639,18 +1639,38 @@ async def get_recent_clip_categories(
     bucket_days: int = 7,
     clips_per_bucket: int = 20,
     half_life_days: float = 21.0,
+    cache_maxdays: int = 7,
 ) -> list[str]:
     """
     Return categories from a user's recent Twitch clips,
     weighted towards more recent clips.
 
     A clip's influence halves every `half_life_days`.
+
+    Results are cached per-user for `cache_maxdays`.
     """
     assert twitch is not None
 
     login = clean_login(login)
 
+    # Stable cache filename so it can persist across multiple days.
+    cache_path = Path("cache") / f"{login}_categories.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Return cached result if it's still fresh.
+    if cache_path.exists():
+        cache_age_seconds = datetime.now().timestamp() - cache_path.stat().st_mtime
+
+        if cache_age_seconds <= cache_maxdays * 86400:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached: list[str] = json.load(f)
+
+            logger.debug("Using cached categories for user %s", login)
+            return cached[:max_categories]
+
+    # Resolve Twitch login to user ID.
     users = [user async for user in twitch.get_users(logins=[login])]
+
     if not users:
         return []
 
@@ -1659,7 +1679,7 @@ async def get_recent_clip_categories(
     now = datetime.now(timezone.utc)
     overall_start = now - timedelta(days=days)
 
-    category_scores: Counter[str] = Counter()
+    category_scores: dict[str, float] = {}
 
     bucket_end = now
 
@@ -1682,33 +1702,62 @@ async def get_recent_clip_categories(
 
             created_at = clip.created_at
 
+            # Defensive fallback in case TwitchAPI ever returns
+            # a timezone-naive datetime.
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
             age_days = max(
                 0.0,
                 (now - created_at).total_seconds() / 86400,
             )
 
-            # 1.0 now
-            # 0.5 after half_life_days
-            # 0.25 after 2 * half_life_days
+            # Recency weighting:
+            #
+            # 0 days old                 -> 1.0
+            # half_life_days old         -> 0.5
+            # 2 * half_life_days old     -> 0.25
             weight = 0.5 ** (age_days / half_life_days)
 
-            category_scores[clip.game_id] += weight
+            category_scores[clip.game_id] = category_scores.get(clip.game_id, 0.0) + weight
 
             clips_seen += 1
+
             if clips_seen >= clips_per_bucket:
                 break
 
         bucket_end = bucket_start
 
     if not category_scores:
-        return []
+        result: list[str] = []
 
-    game_names: dict[str, str] = {}
+    else:
+        game_names: dict[str, str] = {}
 
-    async for game in twitch.get_games(game_ids=list(category_scores.keys())):
-        game_names[game.id] = game.name
+        # Twitch accepts at most 100 game IDs per Get Games request,
+        # so resolve them in batches just in case.
+        game_ids = list(category_scores)
 
-    return [game_names[game_id] for game_id, _ in category_scores.most_common(max_categories) if game_id in game_names]
+        for i in range(0, len(game_ids), 100):
+            batch = game_ids[i : i + 100]
+
+            async for game in twitch.get_games(game_ids=batch):
+                game_names[game.id] = game.name
+
+        ranked_game_ids = sorted(
+            category_scores,
+            key=lambda game_id: category_scores[game_id],
+            reverse=True,
+        )
+
+        # Cache all discovered categories rather than only
+        # `max_categories`, allowing callers to request fewer later.
+        result = [game_names[game_id] for game_id in ranked_game_ids if game_id in game_names]
+
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    return result[:max_categories]
 
 
 async def handle_category_command(msg: ChatMessage) -> bool:
@@ -1727,7 +1776,10 @@ async def handle_category_command(msg: ChatMessage) -> bool:
         return True
 
     login = parts[1]
-    categories = await get_recent_clip_categories(login)
+    if "nocache" in msg.text.lower():
+        categories = await get_recent_clip_categories(login, cache_maxdays=0)
+    else:
+        categories = await get_recent_clip_categories(login, cache_maxdays=3)
     if not categories:
         await msg.reply(f"No recent categories found for user {login}.")
     else:
@@ -1755,8 +1807,12 @@ async def handle_category_intersection_command(msg: ChatMessage) -> bool:
     login1 = parts[1]
     login2 = parts[2]
 
-    categories1 = await get_recent_clip_categories(login1)
-    categories2 = await get_recent_clip_categories(login2)
+    if "nocache" in msg.text.lower():
+        categories1 = await get_recent_clip_categories(login1, cache_maxdays=0)
+        categories2 = await get_recent_clip_categories(login2, cache_maxdays=0)
+    else:
+        categories1 = await get_recent_clip_categories(login1, cache_maxdays=3)
+        categories2 = await get_recent_clip_categories(login2, cache_maxdays=3)
 
     intersection = set(categories1) & set(categories2)
     if not intersection:

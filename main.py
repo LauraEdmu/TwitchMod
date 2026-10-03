@@ -4,9 +4,9 @@ import logging
 import os
 import random
 import re
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 from zoneinfo import ZoneInfo
@@ -1632,6 +1632,110 @@ async def send_to_chat_list(
         )
 
 
+async def get_recent_clip_categories(
+    login: str,
+    days: int = 90,
+    max_clips: int = 100,
+    max_categories: int = 3,
+) -> list[str]:
+    """
+    Return the most common categories found in a user's recent Twitch clips.
+
+    Example:
+        ["Minecraft", "Just Chatting", "Phasmophobia"]
+    """
+    assert twitch is not None
+
+    login = clean_login(login)
+
+    users = [user async for user in twitch.get_users(logins=[login])]
+    if not users:
+        return []
+
+    user = users[0]
+
+    ended_at = datetime.now(timezone.utc)
+    started_at = ended_at - timedelta(days=days)
+
+    category_counts: Counter[str] = Counter()
+    clips_seen = 0
+
+    async for clip in twitch.get_clips(
+        broadcaster_id=user.id,
+        started_at=started_at,
+        ended_at=ended_at,
+        first=min(max_clips, 100),
+    ):
+        if clip.game_id:
+            category_counts[clip.game_id] += 1
+
+        clips_seen += 1
+
+        if clips_seen >= max_clips:
+            break
+
+    if not category_counts:
+        return []
+
+    game_names: dict[str, str] = {}
+
+    async for game in twitch.get_games(game_ids=list(category_counts.keys())):
+        game_names[game.id] = game.name
+
+    return [game_names[game_id] for game_id, _ in category_counts.most_common(max_categories) if game_id in game_names]
+
+
+async def handle_category_command(msg: ChatMessage) -> bool:
+    """
+    Handle a command to display the most common categories in a user's recent clips.
+    Returns True if the command was handled, False otherwise.
+    """
+    if not msg.text.startswith("!categories"):
+        return False
+
+    parts = msg.text.split()
+    if len(parts) < 2:
+        await msg.reply("Usage: !categories <username>")
+        return True
+
+    login = parts[1]
+    categories = await get_recent_clip_categories(login)
+    if not categories:
+        await msg.reply(f"No recent categories found for user {login}.")
+    else:
+        await msg.reply(f"Most common categories for {login}: {', '.join(categories)}")
+
+    return True
+
+
+async def handle_category_intersection_command(msg: ChatMessage) -> bool:
+    """
+    Handle a command to display the intersection of the most common categories in two users' recent clips.
+    Returns True if the command was handled, False otherwise.
+    """
+    if not msg.text.startswith("!category_intersection"):
+        return False
+
+    parts = msg.text.split()
+    if len(parts) < 3:
+        await msg.reply("Usage: !category_intersection <username1> <username2>")
+        return True
+
+    login1 = parts[1]
+    login2 = parts[2]
+
+    categories1 = await get_recent_clip_categories(login1)
+    categories2 = await get_recent_clip_categories(login2)
+
+    intersection = set(categories1) & set(categories2)
+    if not intersection:
+        await msg.reply(f"No common categories found for users {login1} and {login2}.")
+    else:
+        await msg.reply(f"Common categories for {login1} and {login2}: {', '.join(intersection)}")
+
+    return True
+
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------
@@ -1684,6 +1788,10 @@ async def on_message(msg: ChatMessage) -> None:
     if await handle_spike_command(msg):
         return
     if await handle_lemon_command(msg):
+        return
+    if await handle_category_command(msg):
+        return
+    if await handle_category_intersection_command(msg):
         return
 
     await handle_contextual_command(msg)

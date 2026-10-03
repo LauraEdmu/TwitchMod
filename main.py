@@ -1635,14 +1635,16 @@ async def send_to_chat_list(
 async def get_recent_clip_categories(
     login: str,
     days: int = 90,
-    max_clips: int = 100,
-    max_categories: int = 3,
+    max_categories: int = 6,
+    bucket_days: int = 7,
+    clips_per_bucket: int = 20,
+    half_life_days: float = 21.0,
 ) -> list[str]:
     """
-    Return the most common categories found in a user's recent Twitch clips.
+    Return categories from a user's recent Twitch clips,
+    weighted towards more recent clips.
 
-    Example:
-        ["Minecraft", "Just Chatting", "Phasmophobia"]
+    A clip's influence halves every `half_life_days`.
     """
     assert twitch is not None
 
@@ -1654,35 +1656,59 @@ async def get_recent_clip_categories(
 
     user = users[0]
 
-    ended_at = datetime.now(timezone.utc)
-    started_at = ended_at - timedelta(days=days)
+    now = datetime.now(timezone.utc)
+    overall_start = now - timedelta(days=days)
 
-    category_counts: Counter[str] = Counter()
-    clips_seen = 0
+    category_scores: Counter[str] = Counter()
 
-    async for clip in twitch.get_clips(
-        broadcaster_id=user.id,
-        started_at=started_at,
-        ended_at=ended_at,
-        first=min(max_clips, 100),
-    ):
-        if clip.game_id:
-            category_counts[clip.game_id] += 1
+    bucket_end = now
 
-        clips_seen += 1
+    while bucket_end > overall_start:
+        bucket_start = max(
+            overall_start,
+            bucket_end - timedelta(days=bucket_days),
+        )
 
-        if clips_seen >= max_clips:
-            break
+        clips_seen = 0
 
-    if not category_counts:
+        async for clip in twitch.get_clips(
+            broadcaster_id=user.id,
+            started_at=bucket_start,
+            ended_at=bucket_end,
+            first=min(clips_per_bucket, 100),
+        ):
+            if not clip.game_id:
+                continue
+
+            created_at = clip.created_at
+
+            age_days = max(
+                0.0,
+                (now - created_at).total_seconds() / 86400,
+            )
+
+            # 1.0 now
+            # 0.5 after half_life_days
+            # 0.25 after 2 * half_life_days
+            weight = 0.5 ** (age_days / half_life_days)
+
+            category_scores[clip.game_id] += weight
+
+            clips_seen += 1
+            if clips_seen >= clips_per_bucket:
+                break
+
+        bucket_end = bucket_start
+
+    if not category_scores:
         return []
 
     game_names: dict[str, str] = {}
 
-    async for game in twitch.get_games(game_ids=list(category_counts.keys())):
+    async for game in twitch.get_games(game_ids=list(category_scores.keys())):
         game_names[game.id] = game.name
 
-    return [game_names[game_id] for game_id, _ in category_counts.most_common(max_categories) if game_id in game_names]
+    return [game_names[game_id] for game_id, _ in category_scores.most_common(max_categories) if game_id in game_names]
 
 
 async def handle_category_command(msg: ChatMessage) -> bool:
@@ -1690,7 +1716,9 @@ async def handle_category_command(msg: ChatMessage) -> bool:
     Handle a command to display the most common categories in a user's recent clips.
     Returns True if the command was handled, False otherwise.
     """
-    if not msg.text.startswith("!categories"):
+    command_aliases = ["!categories", "!games"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
         return False
 
     parts = msg.text.split()
@@ -1713,7 +1741,10 @@ async def handle_category_intersection_command(msg: ChatMessage) -> bool:
     Handle a command to display the intersection of the most common categories in two users' recent clips.
     Returns True if the command was handled, False otherwise.
     """
-    if not msg.text.startswith("!category_intersection"):
+
+    command_aliases = ["!category_intersection", "!cat_intersection", "!ci", "!game_intersection", "!gi"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
         return False
 
     parts = msg.text.split()

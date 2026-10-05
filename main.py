@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import aiofiles
 import httpx
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from twitchAPI.chat import Chat, ChatMessage, EventData
 from twitchAPI.eventsub.websocket import EventSubWebsocket
 from twitchAPI.oauth import UserAuthenticationStorageHelper
@@ -82,6 +82,16 @@ COUNTERS_PATH = Path("counters") / f"{TARGET_CHANNEL}_counters.json"
 
 DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
 
+NTFY_URL = os.environ.get("NTFY_URL", "")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
+NTFY_PRIORITY = os.environ.get("NTFY_PRIORITY", "unset")
+try:
+    NTFY_PRIORITY = int(NTFY_PRIORITY)
+except ValueError:
+    logger.warning("Invalid NTFY_PRIORITY value: %s. Using default value 3.", NTFY_PRIORITY)
+    NTFY_PRIORITY = 3
+SEND_TO_NTFY = os.getenv("SEND_TO_NTFY", "").lower() in ("1", "true", "yes")
+
 MAX_TIMEOUT_STACK_SIZE = int(os.getenv("MAX_TIMEOUT_STACK_SIZE", "5"))
 
 UK_TZ = ZoneInfo("Europe/London")
@@ -101,6 +111,8 @@ REDEEM_TIMERS_SECONDS = {
 
 dictionary = diction.Dictionary()
 dictionary.read_cache()
+
+source_channel_cache: dict[str, str] = {}
 
 # twitchAPI chat helper uses IRC chat scopes.
 # The timeout API needs MODERATOR_MANAGE_BANNED_USERS.
@@ -166,6 +178,7 @@ CHANNEL_POINT_REWARD_SECONDS = {
     reward_data.get("add_5_minutes", "5_min_id"): 300,
     reward_data.get("add_10_minutes", "10_min_id"): 600,
 }
+
 
 # -----------------------------
 # Data models
@@ -1592,13 +1605,56 @@ CHAT_LIST_URL = os.getenv(
 )
 
 
+async def get_source_channel(msg: ChatMessage) -> str | None:
+    """Return the source channel login if this message came from another shared-chat channel."""
+    assert twitch is not None
+    assert broadcaster_id is not None
+
+    source_room_id = msg.source_room_id
+
+    # Normal chat, or message originated in our own channel.
+    if not source_room_id or source_room_id == broadcaster_id:
+        return None
+
+    if source_room_id in source_channel_cache:
+        return source_channel_cache[source_room_id]
+
+    users = [user async for user in twitch.get_users(user_ids=[source_room_id])]
+
+    if not users:
+        logger.warning(
+            "Could not resolve shared chat source room ID %s",
+            source_room_id,
+        )
+        return None
+
+    login = users[0].login
+    source_channel_cache[source_room_id] = login
+
+    return login
+
+
 async def send_to_chat_list(
-    user: str, message: str, msg: ChatMessage, with_tier: bool = False, test_mode: bool = False
+    user: str,
+    message: str,
+    msg: ChatMessage,
+    with_tier: bool = False,
+    test_mode: bool = False,
+    with_source_channel: bool = False,
 ) -> None:
     if with_tier:  # get the user's tier, as in normal, sub, vip, or mod
-        tier = get_user_tier(msg)  # Replace this with actual logic to determine the user's tier
+        tier = get_user_tier(msg)
 
     colour = msg.user.color or ""
+
+    logger.debug(
+        "Sending message to chat list: user=%s message=%s tier=%s colour=%s source_channel=%s",
+        user,
+        message,
+        tier if with_tier else "normal",
+        colour,
+        await get_source_channel(msg) if with_source_channel else None,
+    )
 
     if test_mode:
         if message.split()[0] in ("mod", "vip", "sub", "normal"):
@@ -1613,6 +1669,7 @@ async def send_to_chat_list(
                     "message": message,
                     "tier": tier if with_tier else "normal",
                     "colour": colour,
+                    "source_channel": await get_source_channel(msg) if with_source_channel else None,
                 },
             )
 
@@ -1628,6 +1685,42 @@ async def send_to_chat_list(
     except httpx.RequestError as e:
         logger.warning(
             "Could not reach chat list: %s",
+            e,
+        )
+
+
+async def send_to_ntfy(
+    user: str,
+    message: str,
+    msg: ChatMessage,
+) -> None:
+    tier = get_user_tier(msg)
+    colour = msg.user.color or ""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.post(
+                f"{NTFY_URL}/{NTFY_TOPIC}",
+                headers={"Priority": str(NTFY_PRIORITY)},
+                json={
+                    "user": user,
+                    "message": message,
+                    "tier": tier,
+                    "colour": colour,
+                },
+            )
+
+        response.raise_for_status()
+
+    except httpx.HTTPStatusError as e:
+        logger.warning(
+            "Ntfy rejected message: %s %s",
+            e.response.status_code,
+            e.response.text,
+        )
+
+    except httpx.RequestError as e:
+        logger.warning(
+            "Could not reach ntfy: %s",
             e,
         )
 
@@ -1823,6 +1916,85 @@ async def handle_category_intersection_command(msg: ChatMessage) -> bool:
     return True
 
 
+async def handle_ntfy_state_change_command(msg: ChatMessage) -> bool:
+    """
+    Handle a command to change the state of ntfy notifications.
+    Returns True if the command was handled, False otherwise.
+    """
+
+    command_aliases = ["!ntfy", "!notify"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
+        return False
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_command")
+        return True
+
+    parts = msg.text.split()
+    if len(parts) < 2:
+        await msg.reply("Usage: !ntfy <toggle|disable/off|enable/on>")
+        return True
+
+    action = parts[1].lower()
+    global SEND_TO_NTFY
+    if action in ["disable", "off"]:
+        SEND_TO_NTFY = False
+        set_key(".env", "SEND_TO_NTFY", "0")
+        await msg.reply("ntfy notifications have been disabled.")
+    elif action in ["enable", "on"]:
+        SEND_TO_NTFY = True
+        set_key(".env", "SEND_TO_NTFY", "1")
+        await msg.reply("ntfy notifications have been enabled.")
+    elif action == "toggle":
+        SEND_TO_NTFY = not SEND_TO_NTFY
+        set_key(".env", "SEND_TO_NTFY", "1" if SEND_TO_NTFY else "0")
+        await msg.reply(f"ntfy notifications have been {'enabled' if SEND_TO_NTFY else 'disabled'}.")
+    else:
+        await msg.reply("Usage: !ntfy <toggle|disable/off|enable/on>")
+
+    return True
+
+
+async def handle_ntfy_priority_command(msg: ChatMessage) -> bool:
+    """
+    Handle a command to change the priority of ntfy notifications.
+    Returns True if the command was handled, False otherwise.
+    """
+
+    command_aliases = ["!ntfy-priority", "!notify-priority", "!ntfy-prio", "!notify-prio"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
+        return False
+
+    if not is_command_allowed(msg):
+        logger.info("[DENIED COMMAND] %s: %r", msg.user.name, msg.text)
+        await msg.reply("Only mods can use that command.")
+        await message_to_audit_log(msg, action="denied_command")
+        return True
+
+    parts = msg.text.split()
+    if len(parts) < 2:
+        await msg.reply("Usage: !ntfy-priority <priority>")
+        return True
+
+    try:
+        priority = int(parts[1])
+        if 1 <= priority <= 5:
+            global NTFY_PRIORITY
+            NTFY_PRIORITY = priority
+            set_key(".env", "NTFY_PRIORITY", str(priority))
+            await msg.reply(f"ntfy notifications priority has been set to {priority}.")
+        else:
+            await msg.reply("Invalid priority value. Please provide an integer between 1 and 5.")
+    except ValueError:
+        await msg.reply("Invalid priority value. Please provide an integer between 1 and 5.")
+
+    return True
+
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------
@@ -1837,7 +2009,9 @@ async def on_message(msg: ChatMessage) -> None:
     global last_readout_message
 
     await message_to_audit_log(msg)
-    await send_to_chat_list(msg.user.name, msg.text, msg=msg, with_tier=True, test_mode=True)
+    await send_to_chat_list(msg.user.name, msg.text, msg=msg, with_tier=True, test_mode=True, with_source_channel=True)
+    if SEND_TO_NTFY:
+        await send_to_ntfy(msg.user.name, msg.text, msg=msg)
 
     normalized_text = advanced_normalise(msg.text)
     if await handle_auto_moderation(msg, normalized_text):
@@ -1879,6 +2053,10 @@ async def on_message(msg: ChatMessage) -> None:
     if await handle_category_command(msg):
         return
     if await handle_category_intersection_command(msg):
+        return
+    if await handle_ntfy_priority_command(msg):
+        return
+    if await handle_ntfy_state_change_command(msg):
         return
 
     await handle_contextual_command(msg)
@@ -2267,7 +2445,7 @@ async def main() -> None:
     logger.info("Moderator login: %s (%s)", moderator_login, moderator_id)
     logger.info("Dry run: %s", DRY_RUN)
 
-    chat = await Chat(twitch)
+    chat = await Chat(twitch, no_shared_chat_messages=False)
     chat.register_event(ChatEvent.READY, on_ready)
     chat.register_event(ChatEvent.MESSAGE, on_message)
 

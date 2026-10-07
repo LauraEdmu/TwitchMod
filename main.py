@@ -85,6 +85,7 @@ DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
 NTFY_URL = os.environ.get("NTFY_URL", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 NTFY_PRIORITY = os.environ.get("NTFY_PRIORITY", "unset")
+INBOXER_URL = os.environ.get("INBOXER_URL", "")
 try:
     NTFY_PRIORITY = int(NTFY_PRIORITY)
 except ValueError:
@@ -1689,7 +1690,7 @@ async def send_to_chat_list(
         )
 
 
-async def send_to_ntfy(
+async def send_message_to_ntfy(
     user: str,
     message: str,
     msg: ChatMessage,
@@ -1723,6 +1724,57 @@ async def send_to_ntfy(
             "Could not reach ntfy: %s",
             e,
         )
+
+
+async def send_arbitrary_message(
+    title: str,
+    body: str,
+    msg: ChatMessage | None = None,
+    go_inboxer: bool = False,
+) -> None:
+    if msg:
+        tier = get_user_tier(msg)
+        colour = msg.user.color or ""
+        user = msg.user.name
+    else:
+        tier = None
+        colour = None
+        user = None
+
+    message_body = body
+
+    metadata = []
+    if user:
+        metadata.append(f"User: {user}")
+    if tier:
+        metadata.append(f"Tier: {tier}")
+
+    if metadata:
+        message_body += "\n\n" + "\n".join(metadata)
+
+    async with httpx.AsyncClient() as client:
+        # ntfy
+        await client.post(
+            f"{NTFY_URL.rstrip('/')}/{NTFY_TOPIC}",
+            content=message_body,
+            headers={
+                "Title": title,
+                "Priority": str(NTFY_PRIORITY),
+            },
+        )
+
+        # Go inboxer
+        if go_inboxer:
+            await client.post(
+                INBOXER_URL,
+                json={
+                    "title": title,
+                    "body": message_body,
+                    "priority": NTFY_PRIORITY,
+                    "colour": colour or "",
+                    "icon": "🟪",
+                },
+            )
 
 
 async def get_recent_clip_categories(
@@ -1995,6 +2047,93 @@ async def handle_ntfy_priority_command(msg: ChatMessage) -> bool:
     return True
 
 
+async def handle_commands_command(msg: ChatMessage) -> bool:
+    """
+    Handle a command to list all available commands.
+    Returns True if the command was handled, False otherwise.
+    """
+
+    command_aliases = ["!commands", "!help"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
+        return False
+    logger.info("[COMMAND] %s: %r", msg.user.name, msg.text)
+
+    commands_list = [
+        "!isregular",
+        "!checkregular",
+        "!amiregular",
+        "!amireg",
+        "!lurk",
+        "!brb",
+        "!afk",
+        "!lurking",
+        "!coinflip",
+        "!flipcoin",
+        "!flip",
+        "!coin",
+        "!bug",
+        "!glitch",
+        "!issue",
+        "!mispronounce",
+        "!mispronunciation",
+        "!mispeak",
+        "!define",
+        "!thesaurus",
+        "!thesaur",
+        "!spike",
+        "!lemon",
+        "!categories",
+        "!games",
+        "!category_intersection",
+        "!cat_intersection",
+        "!ci",
+        "!game_intersection",
+        "!gi",
+    ]
+
+    mod_commands_list = [
+        "!regular",
+        "!addregular",
+        "!removeregular",
+        "!delregular",
+        "!removereg",
+        "!delreg",
+        "!dereg",
+        "!banstack",
+        "!banstacked",
+        "!banlast",
+        "!cleartimeoutstack",
+        "!cleartstack",
+        "!clearstack",
+        "!checktimeoutstack",
+        "!checktstack",
+        "!checkstack",
+        "!shoutout",
+        "!so",
+        "!readout",
+        "!readthat",
+        "!adbreak",
+        "!advertisement",
+        "!ntfy",
+        "!notify",
+        "!ntfy-priority",
+        "!notify-priority",
+        "!ntfy-prio",
+        "!notify-prio",
+    ]
+
+    visible_commands = (
+        commands_list + mod_commands_list
+        if (msg.user.name.lower() == TARGET_CHANNEL or msg.user.mod)
+        else commands_list
+    )
+    for start in range(0, len(visible_commands), 15):
+        command_batch = visible_commands[start : start + 15]
+        await msg.reply("Commands: " + " • ".join(command_batch))
+    return True
+
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------
@@ -2011,7 +2150,13 @@ async def on_message(msg: ChatMessage) -> None:
     await message_to_audit_log(msg)
     await send_to_chat_list(msg.user.name, msg.text, msg=msg, with_tier=True, test_mode=True, with_source_channel=True)
     if SEND_TO_NTFY:
-        await send_to_ntfy(msg.user.name, msg.text, msg=msg)
+        # await send_message_to_ntfy(msg.user.name, msg.text, msg=msg)
+        await send_arbitrary_message(
+            title=f"Message from {msg.user.name}",
+            body=msg.text,
+            msg=msg,
+            go_inboxer=True,
+        )
 
     normalized_text = advanced_normalise(msg.text)
     if await handle_auto_moderation(msg, normalized_text):
@@ -2057,6 +2202,8 @@ async def on_message(msg: ChatMessage) -> None:
     if await handle_ntfy_priority_command(msg):
         return
     if await handle_ntfy_state_change_command(msg):
+        return
+    if await handle_commands_command(msg):
         return
 
     await handle_contextual_command(msg)

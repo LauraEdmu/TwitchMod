@@ -1752,29 +1752,67 @@ async def send_arbitrary_message(
     if metadata:
         message_body += "\n\n" + "\n".join(metadata)
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
         # ntfy
-        await client.post(
-            f"{NTFY_URL.rstrip('/')}/{NTFY_TOPIC}",
-            content=message_body,
-            headers={
-                "Title": title,
-                "Priority": str(NTFY_PRIORITY),
-            },
-        )
+        if NTFY_URL and NTFY_TOPIC:
+            try:
+                response = await client.post(
+                    f"{NTFY_URL.rstrip('/')}/{NTFY_TOPIC}",
+                    content=message_body,
+                    headers={
+                        "Title": title,
+                        "Priority": str(NTFY_PRIORITY),
+                    },
+                )
+                response.raise_for_status()
+
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "Failed to send ntfy notification: %r",
+                    exc,
+                )
 
         # Go inboxer
-        if go_inboxer:
-            await client.post(
-                INBOXER_URL,
-                json={
-                    "title": title,
-                    "body": message_body,
-                    "priority": NTFY_PRIORITY,
-                    "colour": colour or "",
-                    "icon": "🟪",
-                },
-            )
+        if go_inboxer and INBOXER_URL:
+            try:
+                response = await client.post(
+                    INBOXER_URL,
+                    json={
+                        "title": title,
+                        "body": message_body,
+                        "priority": NTFY_PRIORITY,
+                        "colour": colour or "",
+                        "icon": "🟪",
+                    },
+                )
+                response.raise_for_status()
+
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "Failed to send inboxer notification: %r",
+                    exc,
+                )
+
+
+background_tasks: set[asyncio.Task[None]] = set()
+
+
+def run_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+
+    def on_done(task: asyncio.Task[None]) -> None:
+        background_tasks.discard(task)
+
+        if task.cancelled():
+            return
+
+        try:
+            task.result()
+        except Exception:
+            logger.exception("Background task failed")
+
+    task.add_done_callback(on_done)
 
 
 async def get_recent_clip_categories(
@@ -2148,17 +2186,31 @@ async def on_message(msg: ChatMessage) -> None:
     global last_readout_message
 
     await message_to_audit_log(msg)
-    await send_to_chat_list(msg.user.name, msg.text, msg=msg, with_tier=True, test_mode=True, with_source_channel=True)
-    if SEND_TO_NTFY:
-        # await send_message_to_ntfy(msg.user.name, msg.text, msg=msg)
-        await send_arbitrary_message(
-            title=f"Message from {msg.user.name}",
-            body=msg.text,
+
+    run_background(
+        send_to_chat_list(
+            msg.user.name,
+            msg.text,
             msg=msg,
-            go_inboxer=True,
+            with_tier=True,
+            test_mode=True,
+            with_source_channel=True,
+        )
+    )
+
+    if SEND_TO_NTFY:
+        run_background(
+            send_arbitrary_message(
+                title=f"Message from {msg.user.name}",
+                body=msg.text,
+                msg=msg,
+                go_inboxer=True,
+            )
         )
 
     normalized_text = advanced_normalise(msg.text)
+
+    # Keep the rest of your existing handlers unchanged.
     if await handle_auto_moderation(msg, normalized_text):
         timeout_stack.push(msg.user.id)
         return

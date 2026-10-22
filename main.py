@@ -81,6 +81,7 @@ SHOUTOUTS_PATH = Path("user_data") / "shoutouts.json"
 COUNTERS_PATH = Path("counters") / f"{TARGET_CHANNEL}_counters.json"
 
 DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
+QUOTE_WEBHOOK = os.getenv("QUOTE_WEBHOOK", "")
 
 NTFY_URL = os.environ.get("NTFY_URL", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
@@ -1506,6 +1507,40 @@ async def handle_define_command(msg: ChatMessage) -> bool:
     return True
 
 
+async def handle_urban_define_command(msg: ChatMessage) -> bool:
+    text = msg.text.strip()
+
+    command_aliases = ("!urban", "!urbandefine")
+
+    command_used = next(
+        (alias for alias in command_aliases if text == alias or text.startswith(alias + " ")),
+        None,
+    )
+
+    if command_used is None:
+        return False
+
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply("Please provide a word to look up in Urban Dictionary.")
+        return True
+
+    word = parts[1]
+    result = await asyncio.to_thread(dictionary.urban_define, word)
+
+    if result:
+        entries = result[:5]
+        reply_text = "\n\n".join(
+            f"Word: {entry['word']}\nMeaning: {entry['meaning']}\nExample: {entry['example']}" for entry in entries
+        )
+        await msg.reply(reply_text)
+    else:
+        await msg.reply(f"No Urban Dictionary entry found for {word!r}.")
+
+    await message_to_audit_log(msg, action="urban_define_command")
+    return True
+
+
 async def handle_thesaurus_command(msg: ChatMessage) -> bool:
     text = msg.text.strip()
 
@@ -2172,6 +2207,77 @@ async def handle_commands_command(msg: ChatMessage) -> bool:
     return True
 
 
+async def send_to_webhook(
+    title: str,
+    body: str,
+    webhook_url: str,
+    sent_by: str = "",
+) -> bool:
+    import aiohttp
+
+    embed: dict[str, Any] = {
+        "title": title[:256],
+        "description": body[:4096],
+    }
+
+    if sent_by:
+        embed["footer"] = {"text": f"Sent by {sent_by}"[:2048]}
+
+    payload = {"embeds": [embed]}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                webhook_url,
+                json=payload,
+            ) as response:
+                if response.status not in (200, 204):
+                    error = await response.text()
+                    logger.error(
+                        "Failed to send to webhook: %s - %s",
+                        response.status,
+                        error,
+                    )
+                    return False
+
+                logger.info("Webhook sent successfully.")
+                return True
+
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        logger.error("Webhook request failed: %s", exc)
+        return False
+
+
+async def handle_quote_command(msg: ChatMessage) -> bool:
+    command_aliases = ["!quote", "!q", "!addquote"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
+        return False
+
+    logger.info("[COMMAND] %s: %r", msg.user.name, msg.text)
+
+    command_text = msg.text[len(next(alias for alias in command_aliases if msg.text.startswith(alias))) :].strip()
+    if not command_text:
+        await msg.reply("Please provide a quote after the command.")
+        return True
+
+    if QUOTE_WEBHOOK:
+        success = await send_to_webhook(
+            title=f"Quote from {msg.user.name}",
+            body=command_text,
+            webhook_url=QUOTE_WEBHOOK,
+            sent_by=msg.user.name,
+        )
+
+        if success:
+            await msg.reply("Quote submitted successfully.")
+        else:
+            await msg.reply("Failed to submit quote. Please try again.")
+    else:
+        await msg.reply("Quote webhook is not configured.")
+    return True
+
+
 # -----------------------------
 # Chat event handlers
 # -----------------------------
@@ -2241,6 +2347,8 @@ async def on_message(msg: ChatMessage) -> None:
         return
     if await handle_define_command(msg):
         return
+    if await handle_urban_define_command(msg):
+        return
     if await handle_thesaurus_command(msg):
         return
     if await handle_spike_command(msg):
@@ -2256,6 +2364,8 @@ async def on_message(msg: ChatMessage) -> None:
     if await handle_ntfy_state_change_command(msg):
         return
     if await handle_commands_command(msg):
+        return
+    if await handle_quote_command(msg):
         return
 
     await handle_contextual_command(msg)

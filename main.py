@@ -7,6 +7,7 @@ import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 from zoneinfo import ZoneInfo
@@ -82,6 +83,15 @@ COUNTERS_PATH = Path("counters") / f"{TARGET_CHANNEL}_counters.json"
 
 DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
 QUOTE_WEBHOOK = os.getenv("QUOTE_WEBHOOK", "")
+
+rcon_addr = os.getenv("RCON_ADDR", "127.0.0.1")
+rcon_passwd = os.getenv("RCON_PASSWORD", "")
+rcon_apikey = os.getenv("RCON_APIKEY", "")
+
+GAME_STAES = {
+    "minecraft": False,
+    "sts2": False,
+}
 
 NTFY_URL = os.environ.get("NTFY_URL", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
@@ -308,6 +318,68 @@ async def handle_vip_redeem(user_id: str, user_name: str = "") -> bool:
     return True
 
 
+async def handle_spawn_creeper_redeem(
+    data: ChannelPointsCustomRewardRedemptionAddEvent, chat: Chat, reply: bool = True
+) -> bool:
+    event = data.event
+
+    if not rcon_apikey:
+        logger.error("[CREEPER] RCON_APIKEY is not configured")
+        return False
+
+    if DRY_RUN:
+        logger.info(
+            "[DRY RUN] Would spawn a creeper for every player, redeemed by %s",
+            event.user_name,
+        )
+        return False
+
+    api_url = rcon_addr.strip().rstrip("/")
+    if not api_url.startswith(("http://", "https://")):
+        api_url = f"http://{api_url}"
+
+    from urllib.parse import urlsplit
+
+    if urlsplit(api_url).port is None:
+        api_url += ":8765"
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{api_url}/summon",
+                headers={"Authorization": f"Bearer {rcon_apikey}"},
+                json={
+                    "entity": "minecraft:creeper",
+                    "count": 1,
+                },
+            )
+            response.raise_for_status()
+
+        result = response.json()
+
+        if not result.get("command_sent"):
+            logger.warning("[CREEPER] RCON delivery not confirmed: %s", result)
+            return False
+
+        logger.info(
+            "[CREEPER] %s redeemed a creeper spawn: %s",
+            event.user_name,
+            result.get("rcon_response"),
+        )
+
+        if reply and chat.is_ready():
+            await chat.send_message(
+                TARGET_CHANNEL,
+                f"{event.user_name} spawned a creeper beside every player!",
+            )
+
+        return True
+
+    except httpx.HTTPError:
+        logger.exception("[CREEPER] Failed to contact Minecraft API")
+        return False
+
+
 async def handle_check_in_redeem(user_id: str, user_name: str = "") -> int:
     """
     Increment and save a user's check-in count.
@@ -481,6 +553,274 @@ class LimitedStack(Generic[T]):
 
     def __iter__(self):
         return iter(self._items)
+
+
+async def handle_addblock_redeem(
+    data: ChannelPointsCustomRewardRedemptionAddEvent,
+    amount: int = 10,
+) -> bool:
+    """Give the STS2 player block when a channel point reward is redeemed."""
+
+    event = data.event
+
+    if amount <= 0:
+        logger.error("[STS2 BLOCK] Invalid block amount: %d", amount)
+        return False
+
+    if not GAME_STAES.get("sts2", False):
+        logger.info("[STS2 BLOCK] Skipping redeem: STS2 is not enabled")
+        return False
+
+    api_url = os.getenv("STS2_URL", "http://100.115.183.106:8766").rstrip("/")
+    api_key = os.getenv("STS2_API_TOKEN", "")
+
+    if not api_key:
+        logger.error("[STS2 BLOCK] STS2_API_TOKEN is not configured")
+        return False
+
+    if DRY_RUN:
+        logger.info(
+            "[DRY RUN] [STS2 BLOCK] Would give Laura %d block, redeemed by %s",
+            amount,
+            event.user_name,
+        )
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+            response = await client.post(
+                f"{api_url}/block",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"amount": amount},
+            )
+            response.raise_for_status()
+
+        logger.info(
+            "[STS2 BLOCK] %s redeemed +%d block: %s",
+            event.user_name,
+            amount,
+            response.text,
+        )
+
+        return True
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "[STS2 BLOCK] HTTP %d: %s",
+            exc.response.status_code,
+            exc.response.text,
+        )
+        return False
+
+    except httpx.RequestError as exc:
+        logger.error("[STS2 BLOCK] Could not reach STS2 API: %s", exc)
+        return False
+
+
+async def sts2_redeem_request(
+    data: ChannelPointsCustomRewardRedemptionAddEvent,
+    endpoint: str,
+    amount: int,
+) -> bool:
+    """Send a channel point redemption action to the STS2 API."""
+
+    event = data.event
+
+    if not GAME_STAES.get("sts2", False):
+        logger.info("[STS2] Skipping %s redeem: STS2 is not enabled", endpoint)
+        return False
+
+    api_url = os.getenv("STS2_URL", "http://100.115.183.106:8766").rstrip("/")
+    api_key = os.getenv("STS2_API_TOKEN", "")
+
+    if not api_key:
+        logger.error("[STS2] STS2_API_TOKEN is not configured")
+        return False
+
+    if DRY_RUN:
+        logger.info(
+            "[DRY RUN] [STS2] %s would send %s with amount %d",
+            event.user_name,
+            endpoint,
+            amount,
+        )
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+            response = await client.post(
+                f"{api_url}/{endpoint.lstrip('/')}",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"amount": amount},
+            )
+            response.raise_for_status()
+
+        logger.info(
+            "[STS2] %s redeemed %s (amount=%d): %s",
+            event.user_name,
+            endpoint,
+            amount,
+            response.text,
+        )
+        return True
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "[STS2] %s failed: HTTP %d: %s",
+            endpoint,
+            exc.response.status_code,
+            exc.response.text,
+        )
+
+    except httpx.RequestError as exc:
+        logger.error("[STS2] %s connection failed: %s", endpoint, exc)
+
+    return False
+
+
+async def handle_add_gold_redeem(
+    data: ChannelPointsCustomRewardRedemptionAddEvent,
+) -> bool:
+    """Give Laura 10 gold in STS2."""
+    return await sts2_redeem_request(data, "gold", 10)
+
+
+async def handle_draw_card_redeem(
+    data: ChannelPointsCustomRewardRedemptionAddEvent,
+) -> bool:
+    """Draw 1 card in STS2."""
+    return await sts2_redeem_request(data, "draw", 1)
+
+
+async def mcxp_send(msg: ChatMessage) -> None:
+    """Give every online Minecraft player one XP level per Bit cheered."""
+    bits = msg.bits
+    if msg.text.startswith("pretendbits"):
+        try:
+            bits = int(msg.text.split()[1])
+        except ValueError:
+            bits = 100
+    if bits <= 0:
+        return
+
+    # The Minecraft API currently accepts up to 1,000,000 levels per request.
+    if bits > 1_000_000:
+        logger.warning("[MCXP] Cheer of %d Bits exceeds the API limit; skipped", bits)
+        return
+
+    if not rcon_apikey:
+        logger.error("[MCXP] RCON_APIKEY is not configured")
+        return
+
+    if DRY_RUN:
+        logger.info("[DRY RUN] [MCXP] Would give everyone %d levels for %s's cheer", bits, msg.user.name)
+        return
+
+    # RCON_ADDR may be a hostname/IP or a complete HTTP origin including port.
+    api_url = rcon_addr.strip().rstrip("/")
+    if not api_url.startswith(("http://", "https://")):
+        api_url = f"http://{api_url}"
+
+    from urllib.parse import urlsplit
+
+    if urlsplit(api_url).port is None:
+        api_url += ":8765"
+
+    levels = ceil(bits / 2)
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            response = await client.post(
+                f"{api_url}/xp",
+                headers={"Authorization": f"Bearer {rcon_apikey}"},
+                json={"amount": levels, "unit": "levels"},
+            )
+            response.raise_for_status()
+
+        result = response.json()
+        if not result.get("command_sent"):
+            logger.warning("[MCXP] API did not confirm command delivery: %s", result)
+            return
+
+        logger.info(
+            "[MCXP] %s cheered %d Bits: sent +%d levels to everyone; RCON: %s",
+            msg.user.name,
+            bits,
+            levels,
+            result.get("rcon_response"),
+        )
+        await msg.reply(f"Gave everyone +{levels} levels for your cheer!")
+    except httpx.HTTPStatusError as exc:
+        logger.error("[MCXP] HTTP %d from Minecraft API: %s", exc.response.status_code, exc.response.text)
+        await msg.reply("Failed to give everyone XP due to an HTTP error.")
+    except httpx.RequestError as exc:
+        logger.error("[MCXP] Could not reach Minecraft API: %s", exc)
+        await msg.reply("Failed to give everyone XP due to a network error.")
+    except ValueError:
+        logger.exception("[MCXP] Invalid JSON response from Minecraft API")
+        await msg.reply("Failed to give everyone XP due to an invalid response from the API.")
+
+
+async def sts_send(msg: ChatMessage) -> None:
+    """Even Bits give STS2 gold; odd Bits damage the player."""
+
+    bits = msg.bits
+
+    if msg.text.startswith("pretendbits") and is_command_allowed(msg):
+        try:
+            bits = int(msg.text.split()[1])
+        except (ValueError, IndexError):
+            bits = 100
+
+    if bits <= 0:
+        return
+
+    api_url = os.getenv("STS2_URL", "http://100.115.183.106:8766").rstrip("/")
+    api_key = os.getenv("STS2_API_TOKEN", "")
+
+    if not api_key:
+        logger.error("[STS2] STS2_API_TOKEN is not configured")
+        return
+
+    if bits % 4 == 0:
+        endpoint = "/heal"
+        payload = {"amount": bits}
+        description = f"+{bits} health"
+    elif bits % 2 == 0:
+        endpoint = "/gold"
+        payload = {"amount": bits}
+        description = f"+{bits} gold"
+    else:
+        endpoint = "/damage"
+        payload = {"amount": bits, "ignore_block": False}
+        description = f"{bits} damage"
+
+    if DRY_RUN:
+        logger.info("[DRY RUN] [STS2] %s cheered %d Bits: would apply %s", msg.user.name, bits, description)
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+            response = await client.post(
+                f"{api_url}{endpoint}",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+            )
+            response.raise_for_status()
+
+        logger.info("[STS2] %s cheered %d Bits: applied %s", msg.user.name, bits, description)
+
+        await msg.reply(f"Your {bits} Bits gave Laura {description} in Slay the Spire 2!")
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "[STS2] HTTP %d: %s",
+            exc.response.status_code,
+            exc.response.text,
+        )
+
+    except httpx.RequestError as exc:
+        logger.error("[STS2] Could not reach STS2 API: %s", exc)
 
 
 #
@@ -1523,21 +1863,29 @@ async def handle_urban_define_command(msg: ChatMessage) -> bool:
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
         await msg.reply("Please provide a word to look up in Urban Dictionary.")
+        logger.info("No word provided for Urban Dictionary lookup.")
         return True
 
     word = parts[1]
-    result = await asyncio.to_thread(dictionary.urban_define, word)
+    result = await asyncio.to_thread(dictionary.urban_define, word, limit=1)
 
     if result:
         entries = result[:5]
         reply_text = "\n\n".join(
             f"Word: {entry['word']}\nMeaning: {entry['meaning']}\nExample: {entry['example']}" for entry in entries
         )
-        await msg.reply(reply_text)
+
+        if len(reply_text) > 480:  # split into 400 char chunks
+            for i in range(0, len(reply_text), 400):
+                await msg.reply(reply_text[i : i + 400])
+        else:
+            await msg.reply(reply_text)
     else:
         await msg.reply(f"No Urban Dictionary entry found for {word!r}.")
+        logger.info(f"No Urban Dictionary entry found for {word!r}.")
 
     await message_to_audit_log(msg, action="urban_define_command")
+    logger.debug(f"Urban Dictionary lookup completed for {word!r}.")
     return True
 
 
@@ -1985,7 +2333,7 @@ async def handle_category_command(msg: ChatMessage) -> bool:
     """
     command_aliases = ["!categories", "!games"]
 
-    if not any(msg.text.startswith(alias) for alias in command_aliases):
+    if not any(re.match(f"^{alias}\\b", msg.text) for alias in command_aliases):
         return False
 
     parts = msg.text.split()
@@ -2248,6 +2596,51 @@ async def send_to_webhook(
         return False
 
 
+async def send_vote(vote_option: str, sent_by: str = "", vote_url: str = "", vote_apikey: str = "") -> bool:
+
+    import aiohttp
+
+    if not vote_url:
+        vote_url = os.getenv("VOTE_URL", "")
+        if not vote_url:
+            logger.error("Vote URL is not configured.")
+            return False
+
+    if not vote_apikey:
+        vote_apikey = os.getenv("VOTE_APIKEY", "")
+        if not vote_apikey:
+            logger.error("Vote API key is not configured.")
+            return False
+
+    payload = {
+        "option": vote_option,
+        "identity": sent_by,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                vote_url,
+                headers={"X-API-Key": vote_apikey},
+                json=payload,
+            ) as response:
+                if response.status not in (200, 204):
+                    error = await response.text()
+                    logger.error(
+                        "Failed to send vote: %s - %s",
+                        response.status,
+                        error,
+                    )
+                    return False
+
+                logger.info("Vote sent successfully.")
+                return True
+
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        logger.error("Vote request failed: %s", exc)
+        return False
+
+
 async def handle_quote_command(msg: ChatMessage) -> bool:
     command_aliases = ["!quote", "!q", "!addquote"]
 
@@ -2275,6 +2668,80 @@ async def handle_quote_command(msg: ChatMessage) -> bool:
             await msg.reply("Failed to submit quote. Please try again.")
     else:
         await msg.reply("Quote webhook is not configured.")
+    return True
+
+
+async def handle_hug_command(msg: ChatMessage) -> bool:
+    command_aliases = ["!hug"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
+        return False
+
+    logger.info("[COMMAND] %s: %r", msg.user.name, msg.text)
+
+    command_text = msg.text[len(next(alias for alias in command_aliases if msg.text.startswith(alias))) :].strip()
+    if not command_text:
+        await msg.reply("Please provide a user to hug after the command.")
+        return True
+
+    target_user = command_text
+    await msg.reply(f"{msg.user.name} gives a warm hug to {target_user}!")
+    return True
+
+
+async def handle_vote_command(msg: ChatMessage) -> bool:
+    command_aliases = ["!vote"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
+        return False
+
+    logger.info("[COMMAND] %s: %r", msg.user.name, msg.text)
+
+    command_text = msg.text[len(next(alias for alias in command_aliases if msg.text.startswith(alias))) :].strip()
+    if not command_text:
+        await msg.reply("Please provide a vote option after the command.")
+        return True
+
+    vote_components = command_text.split()
+    if len(vote_components) != 1:
+        await msg.reply("Please provide a single integer vote option.")
+        return True
+
+    try:
+        vote_option = int(vote_components[0])
+    except ValueError:
+        await msg.reply("Please provide a single integer vote option.")
+        return True
+
+    success = await send_vote(vote_option=vote_components[0], sent_by=msg.user.name)
+    if success:
+        await msg.reply(f"{msg.user.name} voted for {vote_option}!")
+    else:
+        await msg.reply("Failed to submit vote. Please try again.")
+    return True
+
+
+async def handle_gamestate_change(msg: ChatMessage) -> bool:
+    command_aliases = ["!gamestate"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
+        return False
+
+    logger.info("[COMMAND] %s: %r", msg.user.name, msg.text)
+
+    command_text = msg.text[len(next(alias for alias in command_aliases if msg.text.startswith(alias))) :].strip()
+    if not command_text:
+        await msg.reply("Please provide a game and state after the command.")
+        return True
+
+    components = command_text.split()
+    if len(components) != 2:
+        await msg.reply("Please provide a game and state after the command.")
+        return True
+
+    game, state = components
+    GAME_STAES[game] = state.lower() in ["true", "1", "yes"]
+    await msg.reply(f"Set game state for {game} to {GAME_STAES[game]}.")
     return True
 
 
@@ -2321,6 +2788,12 @@ async def on_message(msg: ChatMessage) -> None:
         timeout_stack.push(msg.user.id)
         return
 
+    if msg.bits > 0 or (msg.text.startswith("pretendbits") and is_command_allowed(msg)):
+        if GAME_STAES.get("minecraft", False):
+            await mcxp_send(msg)
+        if GAME_STAES.get("sts2", False):
+            await sts_send(msg)
+
     if await handle_regular_command(msg):
         return
     if await handle_regular_remove_command(msg):
@@ -2345,6 +2818,12 @@ async def on_message(msg: ChatMessage) -> None:
         return
     if await handle_readout_command(msg):
         return
+    if await handle_quote_command(msg):
+        return
+    if await handle_vote_command(msg):
+        return
+    if await handle_hug_command(msg):
+        return
     if await handle_define_command(msg):
         return
     if await handle_urban_define_command(msg):
@@ -2366,6 +2845,8 @@ async def on_message(msg: ChatMessage) -> None:
     if await handle_commands_command(msg):
         return
     if await handle_quote_command(msg):
+        return
+    if await handle_gamestate_change(msg):
         return
 
     await handle_contextual_command(msg)
@@ -2661,6 +3142,61 @@ async def on_channel_point_redeem(
                 "Could not announce 'VIP' redeem for %s because chat is not ready.",
                 event.user_name,
             )
+    elif event.reward.id == reward_data.get("spawn_creeper", "spawn_creeper_id"):
+        logger.info(
+            f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) with reward ID {event.reward.id!r} is a 'Spawn Creeper' redeem."
+        )
+        await redeem_to_audit_log(data, action="spawn_creeper_redeem")
+
+        success = await handle_spawn_creeper_redeem(data, chat, reply=False)
+        if chat.is_ready():
+            if success:
+                await chat.send_message(
+                    TARGET_CHANNEL, f"{event.user_name} has redeemed 'Spawn Creeper'! A creeper has spawned!"
+                )
+            else:
+                await chat.send_message(TARGET_CHANNEL, f"{event.user_name}'s 'Spawn Creeper' redeem failed.")
+        else:
+            logger.warning(
+                "Could not announce 'Spawn Creeper' redeem for %s because chat is not ready.",
+                event.user_name,
+            )
+    elif event.reward.id == reward_data.get("add_block"):
+        await redeem_to_audit_log(data, action="add_block_redeem")
+
+        amount = 10
+        success = await handle_addblock_redeem(data, amount=amount)
+
+        if chat.is_ready():
+            if success:
+                await chat.send_message(
+                    TARGET_CHANNEL, f"{event.user_name} gave Laura +{amount} block in Slay the Spire 2!"
+                )
+            else:
+                await chat.send_message(TARGET_CHANNEL, f"{event.user_name}'s Add Block redeem couldn't be applied.")
+    elif event.reward.id == reward_data.get("add_gold"):
+        await redeem_to_audit_log(data, action="add_gold_redeem")
+
+        success = await handle_add_gold_redeem(data)
+
+        if chat.is_ready():
+            if success:
+                await chat.send_message(TARGET_CHANNEL, f"{event.user_name} gave Laura +10 gold in Slay the Spire 2!")
+            else:
+                await chat.send_message(TARGET_CHANNEL, f"{event.user_name}'s Add Gold redeem couldn't be applied.")
+
+    elif event.reward.id == reward_data.get("draw_card"):
+        await redeem_to_audit_log(data, action="draw_card_redeem")
+
+        success = await handle_draw_card_redeem(data)
+
+        if chat.is_ready():
+            if success:
+                await chat.send_message(
+                    TARGET_CHANNEL, f"{event.user_name} made Laura draw a card in Slay the Spire 2!"
+                )
+            else:
+                await chat.send_message(TARGET_CHANNEL, f"{event.user_name}'s Draw Card redeem couldn't be applied.")
     else:
         logger.info(
             f"Redeem {event.reward.title!r} by {event.user_name} ({event.user_id}) "

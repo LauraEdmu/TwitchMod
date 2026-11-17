@@ -7,7 +7,6 @@ import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from math import ceil
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 from zoneinfo import ZoneInfo
@@ -83,6 +82,9 @@ COUNTERS_PATH = Path("counters") / f"{TARGET_CHANNEL}_counters.json"
 
 DISCORD_INVITE_LINK = os.getenv("DISCORD_INVITE_LINK", "")
 QUOTE_WEBHOOK = os.getenv("QUOTE_WEBHOOK", "")
+
+universal_counters_path = Path("counters") / "universal_counters.json"
+universal_counters_path.parent.mkdir(parents=True, exist_ok=True)
 
 rcon_addr = os.getenv("RCON_ADDR", "127.0.0.1")
 rcon_passwd = os.getenv("RCON_PASSWORD", "")
@@ -692,31 +694,86 @@ async def handle_draw_card_redeem(
     return await sts2_redeem_request(data, "draw", 1)
 
 
-async def mcxp_send(msg: ChatMessage) -> None:
-    """Give every online Minecraft player one XP level per Bit cheered."""
-    bits = msg.bits
-    if msg.text.startswith("pretendbits"):
+async def mc_send(msg: ChatMessage) -> None:
+    """Trigger Minecraft events based on the number of Bits cheered."""
+
+    bits = int(msg.bits or 0)
+
+    # Testing command (broadcaster/moderators only).
+    parts = msg.text.strip().split()
+    if parts and parts[0].lower() == "pretendbits":
+        if not is_command_allowed(msg):
+            return
+
         try:
-            bits = int(msg.text.split()[1])
-        except ValueError:
+            bits = int(parts[1])
+        except (IndexError, ValueError):
             bits = 100
+
     if bits <= 0:
         return
 
-    # The Minecraft API currently accepts up to 1,000,000 levels per request.
     if bits > 1_000_000:
-        logger.warning("[MCXP] Cheer of %d Bits exceeds the API limit; skipped", bits)
+        logger.warning("[MC] Cheer of %d Bits exceeds the limit; skipped", bits)
         return
 
     if not rcon_apikey:
-        logger.error("[MCXP] RCON_APIKEY is not configured")
+        logger.error("[MC] RCON_APIKEY is not configured")
         return
 
+    # Determine the action: first matching rule wins.
+    if bits == 1:
+        endpoint = "/give"
+        payload = {
+            "item": "minecraft:rose_bush",
+            "count": 1,
+        }
+        description = "give everyone a rose"
+        reply_text = "Gave everyone a rose! 🌹"
+
+    elif bits == 50:
+        endpoint = "/summon"
+        payload = {
+            "entity": "minecraft:lightning_bolt",
+            "count": 1,
+            "at_player": True,
+        }
+        description = "strike everyone with lightning"
+        reply_text = "Struck everyone with lightning! ⚡"
+
+    elif bits % 2 == 0:
+        levels = bits // 2
+
+        endpoint = "/xp"
+        payload = {
+            "amount": levels,
+            "unit": "levels",
+        }
+        description = f"give everyone {levels} XP levels"
+        reply_text = f"Gave everyone +{levels} XP levels! ❇️"
+
+    else:
+        damage = min(bits / 4, 19)
+
+        endpoint = "/damage"
+        payload = {
+            "amount": damage,
+            "type": "minecraft:generic",
+        }
+        description = f"deal {damage:g} damage to everyone"
+        reply_text = f"Dealt {damage:g} damage to everyone! 🔥"
+
+    # DRY_RUN support.
     if DRY_RUN:
-        logger.info("[DRY RUN] [MCXP] Would give everyone %d levels for %s's cheer", bits, msg.user.name)
+        logger.info(
+            "[DRY RUN] [MC] %s: %d Bits would %s",
+            msg.user.name,
+            bits,
+            description,
+        )
         return
 
-    # RCON_ADDR may be a hostname/IP or a complete HTTP origin including port.
+    # Resolve the HTTP API address.
     api_url = rcon_addr.strip().rstrip("/")
     if not api_url.startswith(("http://", "https://")):
         api_url = f"http://{api_url}"
@@ -726,39 +783,51 @@ async def mcxp_send(msg: ChatMessage) -> None:
     if urlsplit(api_url).port is None:
         api_url += ":8765"
 
-    levels = ceil(bits / 2)
-
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
             response = await client.post(
-                f"{api_url}/xp",
+                f"{api_url}{endpoint}",
                 headers={"Authorization": f"Bearer {rcon_apikey}"},
-                json={"amount": levels, "unit": "levels"},
+                json=payload,
             )
             response.raise_for_status()
 
         result = response.json()
-        if not result.get("command_sent"):
-            logger.warning("[MCXP] API did not confirm command delivery: %s", result)
+
+        if not isinstance(result, dict) or not result.get("command_sent"):
+            logger.warning(
+                "[MC] API did not confirm command delivery: %s",
+                result,
+            )
+            await msg.reply("Minecraft event could not be confirmed.")
             return
 
         logger.info(
-            "[MCXP] %s cheered %d Bits: sent +%d levels to everyone; RCON: %s",
+            "[MC] %s cheered %d Bits: %s; RCON: %s",
             msg.user.name,
             bits,
-            levels,
+            description,
             result.get("rcon_response"),
         )
-        await msg.reply(f"Gave everyone +{levels} levels for your cheer!")
+
+        # await msg.reply(f"{reply_text} Check [mc] redeems to affect my game for free!")
+        await msg.reply(f"{reply_text}")
+
     except httpx.HTTPStatusError as exc:
-        logger.error("[MCXP] HTTP %d from Minecraft API: %s", exc.response.status_code, exc.response.text)
-        await msg.reply("Failed to give everyone XP due to an HTTP error.")
+        logger.error(
+            "[MC] HTTP %d from Minecraft API: %s",
+            exc.response.status_code,
+            exc.response.text,
+        )
+        await msg.reply("Failed to trigger Minecraft event (HTTP error).")
+
     except httpx.RequestError as exc:
-        logger.error("[MCXP] Could not reach Minecraft API: %s", exc)
-        await msg.reply("Failed to give everyone XP due to a network error.")
+        logger.error("[MC] Could not reach Minecraft API: %s", exc)
+        await msg.reply("Failed to trigger Minecraft event (network error).")
+
     except ValueError:
-        logger.exception("[MCXP] Invalid JSON response from Minecraft API")
-        await msg.reply("Failed to give everyone XP due to an invalid response from the API.")
+        logger.exception("[MC] Invalid JSON response from Minecraft API")
+        await msg.reply("Failed to trigger Minecraft event (invalid API response).")
 
 
 async def sts_send(msg: ChatMessage) -> None:
@@ -821,6 +890,7 @@ async def sts_send(msg: ChatMessage) -> None:
 
     except httpx.RequestError as exc:
         logger.error("[STS2] Could not reach STS2 API: %s", exc)
+        await msg.reply("Failed to trigger STS2 event (network error).")
 
 
 #
@@ -2555,6 +2625,36 @@ async def handle_commands_command(msg: ChatMessage) -> bool:
     return True
 
 
+universal_counters_lock = asyncio.Lock()
+
+
+async def handle_universal_counter(msg):
+    if not msg.text.startswith("!"):
+        return False
+
+    parts = msg.text[1:].split(maxsplit=1)
+    if not parts:
+        return False
+
+    counter_name = parts[0].lower()
+
+    async with universal_counters_lock:
+        try:
+            async with aiofiles.open(universal_counters_path, "r", encoding="utf-8") as f:
+                universal_counters = json.loads(await f.read())
+        except FileNotFoundError:
+            universal_counters = {}
+
+        universal_counters[counter_name] = universal_counters.get(counter_name, 0) + 1
+        count = universal_counters[counter_name]
+
+        async with aiofiles.open(universal_counters_path, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(universal_counters, ensure_ascii=False, indent=4))
+
+    await msg.reply(f"{counter_name} count: {count}")
+    return True
+
+
 async def send_to_webhook(
     title: str,
     body: str,
@@ -2790,7 +2890,7 @@ async def on_message(msg: ChatMessage) -> None:
 
     if msg.bits > 0 or (msg.text.startswith("pretendbits") and is_command_allowed(msg)):
         if GAME_STAES.get("minecraft", False):
-            await mcxp_send(msg)
+            await mc_send(msg)
         if GAME_STAES.get("sts2", False):
             await sts_send(msg)
 
@@ -2847,6 +2947,8 @@ async def on_message(msg: ChatMessage) -> None:
     if await handle_quote_command(msg):
         return
     if await handle_gamestate_change(msg):
+        return
+    if await handle_universal_counter(msg):  # keep this at the end of the command checks
         return
 
     await handle_contextual_command(msg)

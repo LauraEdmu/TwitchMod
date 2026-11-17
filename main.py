@@ -382,6 +382,88 @@ async def handle_spawn_creeper_redeem(
         return False
 
 
+PET_ANIMALS = frozenset({"cat", "wolf", "horse", "fox", "chicken", "dolphin", "frog"})
+
+
+async def handle_join_as_pet_redeem(
+    data: ChannelPointsCustomRewardRedemptionAddEvent,
+) -> tuple[bool, str]:
+    """Spawn a named animal beside one random online Minecraft player."""
+    event = data.event
+    animal = (event.user_input or "").strip().casefold().split()[0]
+
+    # clean possible punctuation from the animal input
+    animal = re.sub(r"[^\w\s]", "", animal)
+
+    if animal not in PET_ANIMALS:
+        logger.warning("[MC PET] Invalid animal %r from %s", event.user_input, event.user_name)
+        return (
+            False,
+            f"{event.user_name}, choose one of: cat, wolf, horse, fox, chicken, dolphin, or frog.",
+        )
+
+    if not rcon_apikey:
+        logger.error("[MC PET] RCON_APIKEY is not configured")
+        return False, "Minecraft pet redeem couldn't be applied (API not configured)."
+
+    if DRY_RUN:
+        logger.info(
+            "[DRY RUN] [MC PET] Would summon %s named %s beside a random player",
+            animal,
+            event.user_name,
+        )
+        return True, f"[DRY RUN] {event.user_name} would join Minecraft as a {animal}!"
+
+    api_url = rcon_addr.strip().rstrip("/")
+    if not api_url.startswith(("http://", "https://")):
+        api_url = f"http://{api_url}"
+
+    from urllib.parse import urlsplit
+
+    if urlsplit(api_url).port is None:
+        api_url += ":8765"
+
+    payload = {
+        "entity": f"minecraft:{animal}",
+        "count": 1,
+        "random_player": True,  # Supported by the small API change below.
+        "custom_name": event.user_name,
+        "name_visible": True,
+        "nbt_data": {"PersistenceRequired": True},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            response = await client.post(
+                f"{api_url}/summon",
+                headers={"Authorization": f"Bearer {rcon_apikey}"},
+                json=payload,
+            )
+            response.raise_for_status()
+
+        result = response.json()
+        if not isinstance(result, dict) or not result.get("command_sent"):
+            logger.warning("[MC PET] RCON delivery not confirmed: %s", result)
+            return False, f"{event.user_name}'s Minecraft pet redeem couldn't be confirmed."
+
+        logger.info(
+            "[MC PET] %s joined as a %s near a random player: %s",
+            event.user_name,
+            animal,
+            result.get("rcon_response"),
+        )
+        return True, f"{event.user_name} joined Minecraft as a {animal} near a random player!"
+
+    except httpx.HTTPStatusError as exc:
+        logger.error("[MC PET] HTTP %d: %s", exc.response.status_code, exc.response.text)
+    except httpx.RequestError as exc:
+        logger.error("[MC PET] Could not reach Minecraft API: %s", exc)
+    except ValueError:
+        logger.exception("[MC PET] Invalid JSON response from Minecraft API")
+
+    return False, f"{event.user_name}'s Minecraft pet redeem failed."
+
+
 async def handle_check_in_redeem(user_id: str, user_name: str = "") -> int:
     """
     Increment and save a user's check-in count.
@@ -724,12 +806,9 @@ async def mc_send(msg: ChatMessage) -> None:
     # Determine the action: first matching rule wins.
     if bits == 1:
         endpoint = "/give"
-        payload = {
-            "item": "minecraft:rose_bush",
-            "count": 1,
-        }
-        description = "give everyone a rose"
-        reply_text = "Gave everyone a rose! 🌹"
+        payload = {"item": "minecraft:poppy", "count": 1, "custom_name": f"{msg.user.name}"}
+        description = "give everyone a poppy"
+        reply_text = "Gave everyone a poppy! 🌹"
 
     elif bits == 50:
         endpoint = "/summon"
@@ -740,6 +819,18 @@ async def mc_send(msg: ChatMessage) -> None:
         }
         description = "strike everyone with lightning"
         reply_text = "Struck everyone with lightning! ⚡"
+
+    elif bits == 120:
+        endpoint = "/summon"
+        payload = {
+            "entity": "minecraft:creeper",
+            "count": 1,
+            "at_player": True,
+            "nbt_data": {"powered": True},
+            "custom_name": f"{msg.user.name}'s creeper",
+        }
+        description = "summon a charged creeper at everyone"
+        reply_text = "Summoned a charged creeper at everyone! 💥"
 
     elif bits % 2 == 0:
         levels = bits // 2
@@ -758,7 +849,7 @@ async def mc_send(msg: ChatMessage) -> None:
         endpoint = "/damage"
         payload = {
             "amount": damage,
-            "type": "minecraft:generic",
+            "type": "generic",
         }
         description = f"deal {damage:g} damage to everyone"
         reply_text = f"Dealt {damage:g} damage to everyone! 🔥"
@@ -3263,6 +3354,16 @@ async def on_channel_point_redeem(
                 "Could not announce 'Spawn Creeper' redeem for %s because chat is not ready.",
                 event.user_name,
             )
+    elif event.reward.id == reward_data.get("join_as_pet"):
+        success, announcement = await handle_join_as_pet_redeem(data)
+        await redeem_to_audit_log(
+            data,
+            action="join_as_pet_success" if success else "join_as_pet_failed",
+        )
+        if chat.is_ready():
+            await chat.send_message(TARGET_CHANNEL, announcement)
+        else:
+            logger.warning("[MC PET] Chat not ready to announce: %s", announcement)
     elif event.reward.id == reward_data.get("add_block"):
         await redeem_to_audit_log(data, action="add_block_redeem")
 

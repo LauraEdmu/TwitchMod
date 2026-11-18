@@ -90,10 +90,47 @@ rcon_addr = os.getenv("RCON_ADDR", "127.0.0.1")
 rcon_passwd = os.getenv("RCON_PASSWORD", "")
 rcon_apikey = os.getenv("RCON_APIKEY", "")
 
-GAME_STAES = {
+GAME_STATES = {
     "minecraft": False,
     "sts2": False,
 }
+
+
+MC_GAMES_PATH = Path("game_data/mc_games.json")
+
+
+def load_mc_games() -> dict:
+    with MC_GAMES_PATH.open("r", encoding="utf-8") as f:
+        games = json.load(f)
+
+    if not isinstance(games, dict) or not games:
+        raise ValueError("mc_games.json must contain a non-empty object")
+
+    return games
+
+
+def get_default_mc_game(games: dict) -> tuple[str, int]:
+    defaults = [name for name, config in games.items() if config.get("default", False)]
+
+    if len(defaults) != 1:
+        raise ValueError(f"Expected exactly one default Minecraft game, found {len(defaults)}")
+
+    name = defaults[0]
+    port = games[name]["port"]
+
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError(f"Invalid RCON port for {name}: {port}")
+
+    return name, port
+
+
+mc_game, mc_port = get_default_mc_game(load_mc_games())
+
+logger.info(
+    "[MC SELECT] Default Minecraft game: %s (port %d)",
+    mc_game,
+    mc_port,
+)
 
 NTFY_URL = os.environ.get("NTFY_URL", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
@@ -353,6 +390,7 @@ async def handle_spawn_creeper_redeem(
                 json={
                     "entity": "minecraft:creeper",
                     "count": 1,
+                    "port": mc_port,
                 },
             )
             response.raise_for_status()
@@ -430,6 +468,7 @@ async def handle_join_as_pet_redeem(
         "custom_name": event.user_name,
         "name_visible": True,
         "nbt_data": {"PersistenceRequired": True},
+        "port": mc_port,
     }
 
     try:
@@ -651,7 +690,7 @@ async def handle_addblock_redeem(
         logger.error("[STS2 BLOCK] Invalid block amount: %d", amount)
         return False
 
-    if not GAME_STAES.get("sts2", False):
+    if not GAME_STATES.get("sts2", False):
         logger.info("[STS2 BLOCK] Skipping redeem: STS2 is not enabled")
         return False
 
@@ -710,7 +749,7 @@ async def sts2_redeem_request(
 
     event = data.event
 
-    if not GAME_STAES.get("sts2", False):
+    if not GAME_STATES.get("sts2", False):
         logger.info("[STS2] Skipping %s redeem: STS2 is not enabled", endpoint)
         return False
 
@@ -853,6 +892,9 @@ async def mc_send(msg: ChatMessage) -> None:
         }
         description = f"deal {damage:g} damage to everyone"
         reply_text = f"Dealt {damage:g} damage to everyone! 🔥"
+
+    if "port" not in payload:
+        payload["port"] = mc_port
 
     # DRY_RUN support.
     if DRY_RUN:
@@ -2931,8 +2973,92 @@ async def handle_gamestate_change(msg: ChatMessage) -> bool:
         return True
 
     game, state = components
-    GAME_STAES[game] = state.lower() in ["true", "1", "yes"]
-    await msg.reply(f"Set game state for {game} to {GAME_STAES[game]}.")
+    GAME_STATES[game] = state.lower() in ["true", "1", "yes"]
+    await msg.reply(f"Set game state for {game} to {GAME_STATES[game]}.")
+    return True
+
+
+async def handle_mc_select(msg: ChatMessage) -> bool:
+    global mc_game, mc_port
+
+    command_aliases = {"!mc_select", "!mcselect", "!minecraft_select"}
+    parts = msg.text.strip().split()
+
+    if not parts or parts[0].lower() not in command_aliases:
+        return False
+
+    if not is_command_allowed(msg):
+        await msg.reply("You are not allowed to use this command.")
+        return True
+
+    try:
+        games = load_mc_games()
+    except (OSError, ValueError, json.JSONDecodeError):
+        logger.exception("[MC SELECT] Failed to load Minecraft games")
+        await msg.reply("Could not load Minecraft game configuration.")
+        return True
+
+    if len(parts) == 1:
+        available = ", ".join(sorted(games))
+        await msg.reply(
+            f"Current Minecraft game: {mc_game} (port {mc_port}). Available games: {available}. Usage: !mcselect <game>"
+        )
+        return True
+
+    if len(parts) != 2:
+        await msg.reply("Usage: !mcselect <game>")
+        return True
+
+    requested = parts[1].lower()
+
+    # Optional shortcut to return to the configured default.
+    if requested == "default":
+        try:
+            game_name, port = get_default_mc_game(games)
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.error("[MC SELECT] Invalid default game: %s", exc)
+            await msg.reply("The default Minecraft game is misconfigured.")
+            return True
+    else:
+        # Case-insensitive game name lookup.
+        game_name = next(
+            (name for name in games if name.lower() == requested),
+            None,
+        )
+
+        if game_name is None:
+            available = ", ".join(sorted(games))
+            await msg.reply(f"Unknown Minecraft game: {requested}. Available games: {available}")
+            return True
+
+        port = games[game_name].get("port")
+
+    if type(port) is not int or not 1 <= port <= 65535:
+        logger.error(
+            "[MC SELECT] Invalid port for game %s: %r",
+            game_name,
+            port,
+        )
+        await msg.reply(f"Invalid RCON port configured for {game_name}.")
+        return True
+
+    old_game = mc_game
+    old_port = mc_port
+
+    mc_game = game_name
+    mc_port = port
+
+    logger.info(
+        "[MC SELECT] %s switched Minecraft from %s:%d to %s:%d",
+        msg.user.name,
+        old_game,
+        old_port,
+        mc_game,
+        mc_port,
+    )
+
+    await msg.reply(f"Minecraft game selected: {mc_game} (RCON port {mc_port}).")
+
     return True
 
 
@@ -2980,9 +3106,9 @@ async def on_message(msg: ChatMessage) -> None:
         return
 
     if msg.bits > 0 or (msg.text.startswith("pretendbits") and is_command_allowed(msg)):
-        if GAME_STAES.get("minecraft", False):
+        if GAME_STATES.get("minecraft", False):
             await mc_send(msg)
-        if GAME_STAES.get("sts2", False):
+        if GAME_STATES.get("sts2", False):
             await sts_send(msg)
 
     if await handle_regular_command(msg):
@@ -3038,6 +3164,8 @@ async def on_message(msg: ChatMessage) -> None:
     if await handle_quote_command(msg):
         return
     if await handle_gamestate_change(msg):
+        return
+    if await handle_mc_select(msg):
         return
     if await handle_universal_counter(msg):  # keep this at the end of the command checks
         return

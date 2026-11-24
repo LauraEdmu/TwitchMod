@@ -142,6 +142,8 @@ except ValueError:
     logger.warning("Invalid NTFY_PRIORITY value: %s. Using default value 3.", NTFY_PRIORITY)
     NTFY_PRIORITY = 3
 SEND_TO_NTFY = os.getenv("SEND_TO_NTFY", "").lower() in ("1", "true", "yes")
+SEND_TO_DISPLAY = os.getenv("SEND_TO_DISPLAY", "").lower() in ("1", "true", "yes")
+TTS_ALL = os.getenv("TTS_ALL", "").lower() in ("1", "true", "yes")
 
 MAX_TIMEOUT_STACK_SIZE = int(os.getenv("MAX_TIMEOUT_STACK_SIZE", "5"))
 
@@ -469,6 +471,7 @@ async def handle_join_as_pet_redeem(
         "name_visible": True,
         "nbt_data": {"PersistenceRequired": True},
         "port": mc_port,
+        "player": "@r",
     }
 
     try:
@@ -2312,6 +2315,41 @@ async def send_message_to_ntfy(
         )
 
 
+async def send_message_to_display(  # for use if using a physical display device
+    user: str,
+    message: str,
+    msg: ChatMessage,
+) -> None:
+    message = re.sub(r"[^a-zA-Z0-9*-]", "", message)
+    user = re.sub(r"[^a-zA-Z0-9*-]", "", user)
+    if message == "" or user == "":  # Skip sending empty messages to the display
+        return
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.post(
+                "http://10.10.4.209:8080/display",
+                json={
+                    "type": "scroll",
+                    "content": f"{user} -- {message}|350",
+                },
+            )
+
+        response.raise_for_status()
+
+    except httpx.HTTPStatusError as e:
+        logger.warning(
+            "Display rejected message: %s %s",
+            e.response.status_code,
+            e.response.text,
+        )
+
+    except httpx.RequestError as e:
+        logger.warning(
+            "Could not reach display: %s",
+            e,
+        )
+
+
 async def send_arbitrary_message(
     title: str,
     body: str,
@@ -2978,6 +3016,22 @@ async def handle_gamestate_change(msg: ChatMessage) -> bool:
     return True
 
 
+async def handle_ttsall_toggle(msg: ChatMessage) -> bool:
+    command_aliases = ["!ttsall"]
+
+    if not any(msg.text.startswith(alias) for alias in command_aliases):
+        return False
+
+    if not is_command_allowed(msg):
+        await msg.reply("You are not allowed to use this command.")
+        return True
+
+    global TTS_ALL
+    TTS_ALL = not TTS_ALL
+    await msg.reply(f"TTS_ALL is now {'enabled' if TTS_ALL else 'disabled'}.")
+    return True
+
+
 async def handle_mc_select(msg: ChatMessage) -> bool:
     global mc_game, mc_port
 
@@ -3098,6 +3152,13 @@ async def on_message(msg: ChatMessage) -> None:
             )
         )
 
+    if SEND_TO_DISPLAY:  # Send message to physical display if enabled
+        await send_message_to_display(
+            msg.user.name,
+            msg.text,
+            msg,
+        )
+
     normalized_text = advanced_normalise(msg.text)
 
     # Keep the rest of your existing handlers unchanged.
@@ -3167,10 +3228,15 @@ async def on_message(msg: ChatMessage) -> None:
         return
     if await handle_mc_select(msg):
         return
+    if await handle_ttsall_toggle(msg):
+        return
     if await handle_universal_counter(msg):  # keep this at the end of the command checks
         return
 
     await handle_contextual_command(msg)
+
+    if TTS_ALL:
+        await send_tts_message(msg.text)
 
     # Do not store messages sent by the bot itself.
     if BOT_LOGIN and msg.user.name.casefold() == BOT_LOGIN:

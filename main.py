@@ -3152,7 +3152,11 @@ async def on_message(msg: ChatMessage) -> None:
             )
         )
 
-    if SEND_TO_DISPLAY:  # Send message to physical display if enabled
+    if SEND_TO_DISPLAY and msg.user.name.lower() not in [
+        BOT_LOGIN.lower(),
+        "nightbot",
+        "streamelements",
+    ]:  # Send message to physical display if enabled
         await send_message_to_display(
             msg.user.name,
             msg.text,
@@ -3235,7 +3239,7 @@ async def on_message(msg: ChatMessage) -> None:
 
     await handle_contextual_command(msg)
 
-    if TTS_ALL:
+    if TTS_ALL and msg.user.name.lower() not in [BOT_LOGIN.lower(), "nightbot", "streamelements"]:
         await send_tts_message(msg.text)
 
     # Do not store messages sent by the bot itself.
